@@ -199,6 +199,14 @@ export interface AdminStudentSummary extends StudentRecord {
   gradesCount: number;
 }
 
+export interface DefaultSnapshotInfo {
+  exists: boolean;
+  updatedAt: string;
+  gradesCount: number;
+  studentsCount: number;
+  source?: 'import' | 'manual' | 'cloud';
+}
+
 export interface AdminDashboardPayload {
   settings: SchoolSettings;
   students: AdminStudentSummary[];
@@ -210,4 +218,5 @@ export interface AdminDashboardPayload {
   semesterKkm: Record<string, number>;
   classKkm?: Record<string, number>;
   availableMaterials: { code: MaterialCode; name: string }[];
+  defaultSnapshotInfo?: DefaultSnapshotInfo;
 }

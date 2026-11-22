@@ -12,11 +12,13 @@ import {
   getAvailableSemesters,
   getClassKkmMap,
   getDb,
+  getDefaultSnapshotInfo,
   getSemesterKkmMap,
   hashSecret,
   normalizePhone,
   resetDatabaseToSeed,
   sanitizeStudent,
+  saveCustomDefaultSnapshot,
   saveDb,
 } from './src/server/db.ts';
 import type {
@@ -623,6 +625,7 @@ async function startServer() {
       semesterKkm: getSemesterKkmMap(db),
       classKkm: getClassKkmMap(db),
       availableMaterials,
+      defaultSnapshotInfo: getDefaultSnapshotInfo(),
     });
   });
 
@@ -1037,8 +1040,9 @@ async function startServer() {
 
   // 7. Admin: Bulk Import Grades / Students from Excel/CSV parsed rows
   app.post('/api/admin/grades/import', requireAuth('admin'), (req, res) => {
-    const { rows, mode = 'merge' } = req.body as {
+    const { rows, mode = 'merge', setAsDefault = true } = req.body as {
       mode?: 'merge' | 'replace';
+      setAsDefault?: boolean;
       rows?: Array<{
         nis?: string;
         name?: string;
@@ -1315,6 +1319,11 @@ async function startServer() {
     }
 
     saveDb(db);
+    const shouldSetDefault = setAsDefault !== false;
+    const defaultSnapshotInfo = shouldSetDefault
+      ? saveCustomDefaultSnapshot(db, 'import')
+      : getDefaultSnapshotInfo();
+
     const createdStudentsList = createdStudentsRaw.map((stu) => {
       const sGrades = db.grades.filter((g) => g.studentId === stu.id);
       const sAtt = db.attendance.filter((a) => a.studentId === stu.id);
@@ -1344,6 +1353,8 @@ async function startServer() {
       createdStudentsList,
       createdNotifications,
       availableSemesters: db.semesters,
+      savedAsDefault: shouldSetDefault,
+      defaultSnapshotInfo,
     });
   });
 
@@ -2150,14 +2161,33 @@ async function startServer() {
   );
 
   app.post(
-    '/api/admin/reset-default-all',
+    '/api/admin/default-snapshot',
     requireAuth('admin'),
     (_req, res) => {
-      const fresh = resetDatabaseToSeed();
+      const db = getDb();
+      const defaultSnapshotInfo = saveCustomDefaultSnapshot(db, 'manual');
       res.json({
         ok: true,
+        defaultSnapshotInfo,
+      });
+    }
+  );
+
+  app.post(
+    '/api/admin/reset-default-all',
+    requireAuth('admin'),
+    (req, res) => {
+      const { factoryReset } = (req.body ?? {}) as { factoryReset?: boolean };
+      const { db: fresh, restoredFromCustomDefault } = resetDatabaseToSeed(
+        Boolean(factoryReset)
+      );
+      res.json({
+        ok: true,
+        restoredFromCustomDefault,
         studentsCount: fresh.students.length,
+        gradesCount: fresh.grades.length,
         materialsCount: fresh.materials?.length ?? PJOK_MATERIALS.length,
+        defaultSnapshotInfo: getDefaultSnapshotInfo(),
       });
     }
   );
@@ -2174,6 +2204,7 @@ async function startServer() {
       availableSemesters: string[];
       semesterKkm: Record<string, number>;
       classKkm: Record<string, number>;
+      forceOverwrite: boolean;
     }>;
 
     const db = getDb();
@@ -2225,10 +2256,48 @@ async function startServer() {
       Array.isArray(body.grades) &&
       (body.grades.length > 0 || db.grades.length === 0)
     ) {
-      db.grades = body.grades;
+      if (body.forceOverwrite || db.grades.length === 0) {
+        db.grades = body.grades;
+      } else {
+        // Merge by (studentId, semester, materialCode), preserving whichever record is newer
+        const mergedMap = new Map<string, GradeRecord>();
+        const parseTs = (iso?: string) => (iso ? Date.parse(iso) || 0 : 0);
+        for (const existingG of db.grades) {
+          mergedMap.set(
+            `${existingG.studentId}::${existingG.semester}::${existingG.materialCode}`,
+            existingG
+          );
+        }
+        for (const incomingG of body.grades) {
+          const key = `${incomingG.studentId}::${incomingG.semester}::${incomingG.materialCode}`;
+          const prev = mergedMap.get(key);
+          if (!prev || parseTs(incomingG.updatedAt) >= parseTs(prev.updatedAt)) {
+            mergedMap.set(key, incomingG);
+          }
+        }
+        db.grades = Array.from(mergedMap.values());
+      }
     }
     if (Array.isArray(body.attendance)) {
-      db.attendance = body.attendance;
+      if (body.forceOverwrite || db.attendance.length === 0) {
+        db.attendance = body.attendance;
+      } else {
+        const attMap = new Map<string, AttendanceRecord>();
+        for (const a of db.attendance) {
+          attMap.set(`${a.studentId}::${a.date}`, a);
+        }
+        for (const incomingA of body.attendance) {
+          const key = `${incomingA.studentId}::${incomingA.date}`;
+          const prev = attMap.get(key);
+          if (
+            !prev ||
+            `${incomingA.date} ${incomingA.time}` >= `${prev.date} ${prev.time}`
+          ) {
+            attMap.set(key, incomingA);
+          }
+        }
+        db.attendance = Array.from(attMap.values());
+      }
     }
     if (Array.isArray(body.notifications)) {
       db.notifications = body.notifications;

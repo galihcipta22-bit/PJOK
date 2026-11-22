@@ -62,6 +62,52 @@ export const AUTHORIZED_ADMIN_EMAIL = 'galihcipta22@gmail.com';
 const DEFAULT_KKM = 78;
 const LEGACY_TEACHER_NIP = '19920514 201903 1 008';
 const CURRENT_TEACHER_NIP = '19890526 202221 1 006';
+const FIRESTORE_BATCH_LIMIT = 180;
+
+function isNonRetryableFirestoreError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /permission-denied|insufficient permissions|unauthenticated|resource-exhausted|quota|invalid-argument|not-found|already-exists/i.test(
+    msg
+  );
+}
+
+async function withCloudRetry<T>(
+  fn: () => Promise<T>,
+  label: string,
+  maxAttempts = 3
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (isNonRetryableFirestoreError(err) || attempt === maxAttempts) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient =
+        /unavailable|deadline-exceeded|aborted|internal|network|failed to fetch|offline|timeout|reset/i.test(
+          msg
+        );
+      if (!isTransient) {
+        throw err;
+      }
+      console.warn(
+        `Cloud Firestore transient retry (${attempt}/${maxAttempts}) [${label}]:`,
+        msg
+      );
+      await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
+    }
+  }
+  throw lastError;
+}
+
+function clampOptionalScore(val: number | null | undefined): number | null {
+  return typeof val === 'number' && Number.isFinite(val)
+    ? Math.max(0, Math.min(100, Math.round(val)))
+    : null;
+}
 
 function normalizeTeacherNip(nip: unknown): string {
   const value = String(nip ?? '');
@@ -940,8 +986,8 @@ async function upsertPublicPortalSnapshots(params: {
   let pubBatch = writeBatch(db);
   let pubOps = 0;
   const commitPubBatch = async (force = false) => {
-    if (pubOps >= 350 || (force && pubOps > 0)) {
-      await pubBatch.commit();
+    if (pubOps >= FIRESTORE_BATCH_LIMIT || (force && pubOps > 0)) {
+      await withCloudRetry(() => pubBatch.commit(), 'public_portal_batch');
       pubBatch = writeBatch(db);
       pubOps = 0;
     }
@@ -1086,8 +1132,8 @@ export async function syncGradeDeltaToCloud(params: {
       let stuBatch = writeBatch(db);
       let stuOps = 0;
       const commitStu = async (force = false) => {
-        if (stuOps >= 350 || (force && stuOps > 0)) {
-          await stuBatch.commit();
+        if (stuOps >= FIRESTORE_BATCH_LIMIT || (force && stuOps > 0)) {
+          await withCloudRetry(() => stuBatch.commit(), 'delta_students_batch');
           stuBatch = writeBatch(db);
           stuOps = 0;
         }
@@ -1173,8 +1219,8 @@ export async function syncGradeDeltaToCloud(params: {
       let gBatch = writeBatch(db);
       let gOps = 0;
       const commitGrades = async (force = false) => {
-        if (gOps >= 350 || (force && gOps > 0)) {
-          await gBatch.commit();
+        if (gOps >= FIRESTORE_BATCH_LIMIT || (force && gOps > 0)) {
+          await withCloudRetry(() => gBatch.commit(), 'delta_grades_batch');
           gBatch = writeBatch(db);
           gOps = 0;
         }
@@ -1188,8 +1234,8 @@ export async function syncGradeDeltaToCloud(params: {
           semester: String(g.semester).slice(0, 64),
           materialCode: String(g.materialCode).slice(0, 64),
           materialName: String(g.materialName).slice(0, 120),
-          praktikScore: g.praktikScore,
-          pengetahuanScore: g.pengetahuanScore,
+          praktikScore: clampOptionalScore(g.praktikScore),
+          pengetahuanScore: clampOptionalScore(g.pengetahuanScore),
           teacherNote: (g.teacherNote || '').slice(0, 495),
           remedialDetail: (g.remedialDetail || '').slice(0, 495),
           updatedAt: (g.updatedAt || new Date().toISOString()).slice(0, 64),
@@ -1215,18 +1261,19 @@ export async function syncGradeDeltaToCloud(params: {
       await commitGrades(true);
     }
 
-    // 3. Insert newly created notifications
+    // 3. Insert newly created notifications (capped at newest 40 per bulk burst; student_reports retains full per-student logs)
     if (createdNotifications.length > 0) {
+      const notificationsToSync = createdNotifications.slice(0, 40);
       let nBatch = writeBatch(db);
       let nOps = 0;
       const commitNotifs = async (force = false) => {
-        if (nOps >= 350 || (force && nOps > 0)) {
-          await nBatch.commit();
+        if (nOps >= FIRESTORE_BATCH_LIMIT || (force && nOps > 0)) {
+          await withCloudRetry(() => nBatch.commit(), 'delta_notifications_batch');
           nBatch = writeBatch(db);
           nOps = 0;
         }
       };
-      for (const n of createdNotifications) {
+      for (const n of notificationsToSync) {
         const nId = sanitizeFirestoreId(n.id, 'notif');
         const sId = sanitizeFirestoreId(n.studentId, 'stu');
         nBatch.set(doc(db, 'notifications', nId), {
@@ -1304,8 +1351,8 @@ export async function syncGradeDeltaToCloud(params: {
       let rBatch = writeBatch(db);
       let rOps = 0;
       const commitReports = async (force = false) => {
-        if (rOps >= 350 || (force && rOps > 0)) {
-          await rBatch.commit();
+        if (rOps >= FIRESTORE_BATCH_LIMIT || (force && rOps > 0)) {
+          await withCloudRetry(() => rBatch.commit(), 'delta_student_reports_batch');
           rBatch = writeBatch(db);
           rOps = 0;
         }
@@ -1446,7 +1493,7 @@ export async function syncGradeDeltaToCloud(params: {
         });
       }
     }
-    await pubBatch.commit();
+    await withCloudRetry(() => pubBatch.commit(), 'delta_public_portal');
   });
 }
 
@@ -1524,8 +1571,8 @@ async function syncStudentReportsSubset(params: {
   let batch = writeBatch(db);
   let ops = 0;
   const commitIfNeeded = async (force = false) => {
-    if (ops >= 350 || (force && ops > 0)) {
-      await batch.commit();
+    if (ops >= FIRESTORE_BATCH_LIMIT || (force && ops > 0)) {
+      await withCloudRetry(() => batch.commit(), 'student_reports_subset');
       batch = writeBatch(db);
       ops = 0;
     }
@@ -1742,8 +1789,8 @@ export async function syncAttendanceDeltaToCloud(
     let batch = writeBatch(db);
     let ops = 0;
     const commitIfNeeded = async (force = false) => {
-      if (ops >= 350 || (force && ops > 0)) {
-        await batch.commit();
+      if (ops >= FIRESTORE_BATCH_LIMIT || (force && ops > 0)) {
+        await withCloudRetry(() => batch.commit(), 'delta_attendance_batch');
         batch = writeBatch(db);
         ops = 0;
       }
@@ -1949,8 +1996,8 @@ export async function syncStudentsDeltaToCloud(
     let stuBatch = writeBatch(db);
     let stuOps = 0;
     const commitStu = async (force = false) => {
-      if (stuOps >= 350 || (force && stuOps > 0)) {
-        await stuBatch.commit();
+      if (stuOps >= FIRESTORE_BATCH_LIMIT || (force && stuOps > 0)) {
+        await withCloudRetry(() => stuBatch.commit(), 'students_delta_batch');
         stuBatch = writeBatch(db);
         stuOps = 0;
       }
@@ -2012,7 +2059,7 @@ export async function syncStudentsDeltaToCloud(
     }
     await commitStu(true);
 
-    // Seed initial default grades for newly added students without scanning all 5,376 grades
+    // Seed initial default grades for newly added students without scanning all grades
     if (addedStudentIds.size > 0) {
       const newGrades = payload.grades.filter((g) =>
         addedStudentIds.has(sanitizeFirestoreId(g.studentId, 'stu'))
@@ -2020,8 +2067,8 @@ export async function syncStudentsDeltaToCloud(
       let gBatch = writeBatch(db);
       let gOps = 0;
       const commitGrades = async (force = false) => {
-        if (gOps >= 350 || (force && gOps > 0)) {
-          await gBatch.commit();
+        if (gOps >= FIRESTORE_BATCH_LIMIT || (force && gOps > 0)) {
+          await withCloudRetry(() => gBatch.commit(), 'students_new_grades_batch');
           gBatch = writeBatch(db);
           gOps = 0;
         }
@@ -2207,8 +2254,8 @@ async function syncFullDatabaseToCloudInternal(
   let stuBatch = writeBatch(db);
   let stuOps = 0;
   const commitStuBatchIfNeeded = async (force = false) => {
-    if (stuOps >= 350 || (force && stuOps > 0)) {
-      await stuBatch.commit();
+    if (stuOps >= FIRESTORE_BATCH_LIMIT || (force && stuOps > 0)) {
+      await withCloudRetry(() => stuBatch.commit(), 'full_students_batch');
       stuBatch = writeBatch(db);
       stuOps = 0;
     }
@@ -2295,8 +2342,8 @@ async function syncFullDatabaseToCloudInternal(
   let batch = writeBatch(db);
   let ops = 0;
   const commitBatchIfNeeded = async (force = false) => {
-    if (ops >= 350 || (force && ops > 0)) {
-      await batch.commit();
+    if (ops >= FIRESTORE_BATCH_LIMIT || (force && ops > 0)) {
+      await withCloudRetry(() => batch.commit(), 'full_data_batch');
       batch = writeBatch(db);
       ops = 0;
     }
@@ -2731,12 +2778,77 @@ export async function loadAdminDashboardFromCloud(
   const missingCloudGrades =
     grades.length === 0 &&
     Boolean(fallbackPayload && fallbackPayload.grades.length > 0);
-  const rawOrRecoveredGrades =
-    missingCloudGrades && fallbackPayload ? fallbackPayload.grades : grades;
+
+  // Bidirectional timestamp-aware grade & attendance merge so stale Cloud data never overwrites fresher local server edits
+  let mergedBaseGrades: GradeRecord[] = missingCloudGrades && fallbackPayload
+    ? fallbackPayload.grades
+    : grades;
+  let localHasFresherData = false;
+
+  if (fallbackPayload && !missingCloudGrades && fallbackPayload.grades.length > 0) {
+    const parseTs = (iso?: string) => (iso ? Date.parse(iso) || 0 : 0);
+    const cloudMaxTs = grades.reduce(
+      (max, g) => Math.max(max, parseTs(g.updatedAt)),
+      0
+    );
+    const localMaxTs = fallbackPayload.grades.reduce(
+      (max, g) => Math.max(max, parseTs(g.updatedAt)),
+      0
+    );
+
+    const mergedGradeMap = new Map<string, GradeRecord>();
+    grades.forEach((g) => {
+      mergedGradeMap.set(`${g.studentId}::${g.semester}::${g.materialCode}`, g);
+    });
+
+    for (const localG of fallbackPayload.grades) {
+      const key = `${localG.studentId}::${localG.semester}::${localG.materialCode}`;
+      const cloudG = mergedGradeMap.get(key);
+      const localTs = parseTs(localG.updatedAt);
+      const cloudTs = cloudG ? parseTs(cloudG.updatedAt) : 0;
+      if (!cloudG) {
+        if (localTs > cloudMaxTs || localMaxTs > cloudMaxTs + 2000) {
+          mergedGradeMap.set(key, localG);
+          localHasFresherData = true;
+        }
+      } else if (localTs > cloudTs + 1000) {
+        mergedGradeMap.set(key, localG);
+        localHasFresherData = true;
+      }
+    }
+
+    if (localHasFresherData) {
+      mergedBaseGrades = Array.from(mergedGradeMap.values());
+    }
+  }
+
+  let effectiveBaseAttendance = attendance;
+  if (fallbackPayload && fallbackPayload.attendance.length > 0) {
+    const attMap = new Map<string, AttendanceRecord>();
+    attendance.forEach((a) => attMap.set(`${a.studentId}::${a.date}`, a));
+    let localAttAdded = false;
+    for (const localA of fallbackPayload.attendance) {
+      const key = `${localA.studentId}::${localA.date}`;
+      const cloudA = attMap.get(key);
+      if (
+        !cloudA ||
+        `${localA.date} ${localA.time}` > `${cloudA.date} ${cloudA.time}`
+      ) {
+        attMap.set(key, localA);
+        localAttAdded = true;
+      }
+    }
+    if (localAttAdded) {
+      effectiveBaseAttendance = Array.from(attMap.values()).sort((a, b) =>
+        `${b.date} ${b.time}`.localeCompare(`${a.date} ${a.time}`)
+      );
+      localHasFresherData = true;
+    }
+  }
 
   const migratedGrades = legacyMaterialsDetected
-    ? migrateLegacyGrades(rawOrRecoveredGrades)
-    : rawOrRecoveredGrades;
+    ? migrateLegacyGrades(mergedBaseGrades)
+    : mergedBaseGrades;
   const oldSeedGradesDetected = isOldDeterministicSeedGrades(migratedGrades);
   const baseGrades = oldSeedGradesDetected
     ? migratedGrades.map((g) => ({
@@ -2759,7 +2871,7 @@ export async function loadAdminDashboardFromCloud(
   });
   const effectiveGrades = reconciledCloudGrades.grades;
 
-  const strippedCloudAtt = stripSeedDefaultAttendance(attendance);
+  const strippedCloudAtt = stripSeedDefaultAttendance(effectiveBaseAttendance);
   const effectiveAttendance = strippedCloudAtt.attendance;
 
   const students: AdminStudentSummary[] = rawStudents
@@ -2802,6 +2914,7 @@ export async function loadAdminDashboardFromCloud(
     semesterKkm,
     classKkm,
     availableMaterials,
+    defaultSnapshotInfo: fallbackPayload?.defaultSnapshotInfo,
   };
 
   if (
@@ -2810,6 +2923,7 @@ export async function loadAdminDashboardFromCloud(
     previous7MaterialsDetected ||
     oldSeedGradesDetected ||
     missingCloudGrades ||
+    localHasFresherData ||
     reconciledCloudGrades.changed ||
     strippedCloudAtt.removedCount > 0 ||
     !hasStoredClassKkm

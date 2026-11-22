@@ -51,6 +51,7 @@ import type {
   AdminStudentSummary,
   AttendanceMethod,
   AttendanceStatus,
+  DefaultSnapshotInfo,
   GradeRecord,
   MaterialCode,
   NotificationRecord,
@@ -91,6 +92,7 @@ export interface GradeMutationUpdate {
   availableSemesters?: string[];
   replaceAllGrades?: boolean;
   removedGradeIds?: string[];
+  defaultSnapshotInfo?: DefaultSnapshotInfo;
 }
 
 export type AdminRefreshScope =
@@ -157,6 +159,7 @@ type PendingImportState =
       target: 'grades';
       fileName: string;
       mode: ImportMode;
+      setAsDefault: boolean;
       rows: Awaited<ReturnType<typeof parseSpreadsheetFile>>;
     }
   | {
@@ -263,6 +266,7 @@ export function AdminDashboard({
     semesterKkm,
     classKkm: rawClassKkm,
     availableMaterials,
+    defaultSnapshotInfo,
   } = payload;
 
   const classKkm = useMemo(
@@ -443,6 +447,7 @@ export function AdminDashboard({
     useState(false);
   const [confirmResetAll, setConfirmResetAll] = useState(false);
   const [resettingDefaultAll, setResettingDefaultAll] = useState(false);
+  const [savingDefaultSnapshot, setSavingDefaultSnapshot] = useState(false);
 
   // Settings State
   const [draftSettings, setDraftSettings] = useState<SchoolSettings>(settings);
@@ -451,6 +456,7 @@ export function AdminDashboard({
 
   // Import Mode & Confirmation Modal State
   const [gradeImportMode, setGradeImportMode] = useState<ImportMode>('merge');
+  const [setImportAsDefault, setSetImportAsDefault] = useState<boolean>(true);
   const [studentImportMode, setStudentImportMode] =
     useState<ImportMode>('merge');
   const [pendingImport, setPendingImport] = useState<PendingImportState | null>(
@@ -1333,6 +1339,7 @@ export function AdminDashboard({
         target: 'grades',
         fileName: file.name,
         mode: gradeImportMode,
+        setAsDefault: setImportAsDefault,
         rows: validRows,
       });
     } catch {
@@ -1379,6 +1386,7 @@ export function AdminDashboard({
           body: JSON.stringify({
             rows: rowsToSend,
             mode: pendingImport.mode,
+            setAsDefault: pendingImport.setAsDefault,
           }),
         });
         const json = await safeParseJson<{
@@ -1392,6 +1400,8 @@ export function AdminDashboard({
           createdStudentsList?: AdminStudentSummary[];
           createdNotifications?: NotificationRecord[];
           availableSemesters?: string[];
+          savedAsDefault?: boolean;
+          defaultSnapshotInfo?: DefaultSnapshotInfo;
           error?: string;
         }>(res);
         if (!res.ok) {
@@ -1401,10 +1411,13 @@ export function AdminDashboard({
           });
           return;
         }
+        const defaultSuffix = json.savedAsDefault
+          ? ' Data nilai ini juga otomatis ditetapkan sebagai Default Portal.'
+          : '';
         const summaryMsg =
           json.mode === 'replace'
-            ? `Replace seluruh nilai berhasil: ${json.removedCount ?? 0} entri nilai lama diganti dengan ${json.updatedCount ?? 0} data nilai baru (${json.createdStudents ?? 0} siswa baru ditambahkan).`
-            : `Import nilai berhasil & tersinkron: ${json.createdCount ?? 0} nilai baru ditambahkan, ${json.editedCount ?? 0} nilai diperbarui (${json.createdStudents ?? 0} siswa baru).`;
+            ? `Replace seluruh nilai berhasil: ${json.removedCount ?? 0} entri nilai lama diganti dengan ${json.updatedCount ?? 0} data nilai baru (${json.createdStudents ?? 0} siswa baru ditambahkan).${defaultSuffix}`
+            : `Import nilai berhasil & tersinkron: ${json.createdCount ?? 0} nilai baru ditambahkan, ${json.editedCount ?? 0} nilai diperbarui (${json.createdStudents ?? 0} siswa baru).${defaultSuffix}`;
         setFeedbackBanner({
           type: 'success',
           text: summaryMsg,
@@ -1417,6 +1430,7 @@ export function AdminDashboard({
             createdNotifications: json.createdNotifications ?? [],
             availableSemesters: json.availableSemesters,
             replaceAllGrades: json.mode === 'replace',
+            defaultSnapshotInfo: json.defaultSnapshotInfo,
           });
         } else {
           await onRefresh();
@@ -2294,15 +2308,58 @@ export function AdminDashboard({
     }
   }
 
-  async function handleResetDefaultAll() {
+  async function handleSaveCurrentAsDefault() {
+    setSavingDefaultSnapshot(true);
+    setFeedbackBanner(null);
+    try {
+      const res = await apiFetchWithRetry('/api/admin/default-snapshot', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const json = await safeParseJson<{
+        defaultSnapshotInfo?: DefaultSnapshotInfo;
+        error?: string;
+      }>(res);
+      if (!res.ok) {
+        setFeedbackBanner({
+          type: 'error',
+          text: json.error || 'Gagal menyimpan kondisi data saat ini sebagai default.',
+        });
+        return;
+      }
+      setFeedbackBanner({
+        type: 'success',
+        text: `Data nilai (${json.defaultSnapshotInfo?.gradesCount ?? grades.length} entri) & siswa (${json.defaultSnapshotInfo?.studentsCount ?? students.length} siswa) saat ini berhasil disimpan sebagai Default Portal.`,
+      });
+      await onRefresh('pull');
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        text: 'Gagal terhubung ke server saat menyimpan snapshot default.',
+      });
+    } finally {
+      setSavingDefaultSnapshot(false);
+    }
+  }
+
+  async function handleResetDefaultAll(factoryReset = false) {
     setResettingDefaultAll(true);
     setFeedbackBanner(null);
     try {
       const res = await apiFetchWithRetry('/api/admin/reset-default-all', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ factoryReset }),
       });
-      const json = await safeParseJson<{ error?: string }>(res);
+      const json = await safeParseJson<{
+        restoredFromCustomDefault?: boolean;
+        studentsCount?: number;
+        gradesCount?: number;
+        error?: string;
+      }>(res);
       if (!res.ok) {
         setFeedbackBanner({
           type: 'error',
@@ -2313,9 +2370,11 @@ export function AdminDashboard({
       setConfirmResetAll(false);
       setFeedbackBanner({
         type: 'success',
-        text: 'Seluruh data portal (8 Materi Inti PJOK, KKM Kelas 7 = 78, 224 siswa dengan nilai awal 75) berhasil direset ke default.',
+        text: json.restoredFromCustomDefault
+          ? `Seluruh data berhasil dipulihkan ke Default Hasil Import (${json.studentsCount ?? students.length} siswa, ${json.gradesCount ?? 0} entri nilai) dan disinkronkan.`
+          : 'Seluruh data portal (8 Materi Inti PJOK, KKM Kelas 7 = 78, 224 siswa dengan nilai awal 75) berhasil direset ke setelan awal pabrik.',
       });
-      await onRefresh();
+      await onRefresh('full');
     } catch {
       setFeedbackBanner({
         type: 'error',
@@ -3829,7 +3888,7 @@ export function AdminDashboard({
                 Unduh Template Kosong Semua Siswa (.xlsx)
               </button>
 
-              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2">
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 space-y-2.5">
                 <p className="text-[11px] font-semibold text-slate-700">
                   Mode Import Nilai
                 </p>
@@ -3862,6 +3921,22 @@ export function AdminDashboard({
                     ? `Menghapus seluruh ${grades.length} entri nilai lama lalu menggantinya penuh dengan isi file.`
                     : 'Menambahkan nilai baru dan memperbarui baris nilai yang diedit saja tanpa menghapus data lain.'}
                 </p>
+                <label className="flex cursor-pointer items-start gap-2 rounded-lg border border-emerald-200 bg-emerald-50/70 px-2.5 py-2 text-[11px] text-emerald-900">
+                  <input
+                    type="checkbox"
+                    checked={setImportAsDefault}
+                    onChange={(e) => setSetImportAsDefault(e.target.checked)}
+                    className="mt-0.5 h-3.5 w-3.5 rounded border-emerald-400 text-emerald-600 focus:ring-emerald-500"
+                  />
+                  <span className="leading-snug">
+                    <span className="font-semibold">
+                      Jadikan Nilai Import sebagai Default
+                    </span>
+                    <span className="block text-[10px] text-emerald-700">
+                      Menyimpan nilai hasil import sebagai acuan default cadangan server & Cloud.
+                    </span>
+                  </span>
+                </label>
               </div>
 
               <label
@@ -5917,22 +5992,53 @@ export function AdminDashboard({
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-6">
-              <h3 className="font-display text-sm font-bold text-slate-900">
-                Reset Data Portal ke Default
-              </h3>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h3 className="font-display text-sm font-bold text-slate-900">
+                  Data Default Portal & Cadangan Pemulihan
+                </h3>
+                {defaultSnapshotInfo?.exists && (
+                  <span className="rounded-md bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700 border border-emerald-200">
+                    Default Aktif ({defaultSnapshotInfo.gradesCount} nilai)
+                  </span>
+                )}
+              </div>
               <p className="mt-1 text-xs text-slate-500">
-                Mengembalikan seluruh data portal ke setelan default (8 Materi
-                Inti PJOK termasuk Aktifitas Aquatik, KKM Kelas 7 = 78, 224 data
-                siswa dengan nilai awal 75, serta absensi bawaan) lalu
-                menyinkronkannya ke Cloud Firestore.
+                {defaultSnapshotInfo?.exists ? (
+                  <>
+                    Portal menggunakan <strong>Data Default Hasil {defaultSnapshotInfo.source === 'manual' ? 'Simpan Manual' : 'Import Nilai'}</strong>{' '}
+                    ({defaultSnapshotInfo.studentsCount} siswa,{' '}
+                    {defaultSnapshotInfo.gradesCount} entri nilai · disimpan{' '}
+                    {new Date(defaultSnapshotInfo.updatedAt).toLocaleString('id-ID')}).
+                    Setiap pemulihan otomatis atau reset default akan kembali ke data ini.
+                  </>
+                ) : (
+                  <>
+                    Belum ada snapshot default hasil import. Saat Anda mengimpor
+                    nilai atau menekan tombol Simpan sebagai Default di bawah,
+                    data tersebut otomatis menjadi data default portal.
+                  </>
+                )}
               </p>
               <div className="mt-4 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  disabled={savingDefaultSnapshot}
+                  onClick={handleSaveCurrentAsDefault}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+                >
+                  <Save className="h-3.5 w-3.5" />
+                  <span>
+                    {savingDefaultSnapshot
+                      ? 'Menyimpan Default...'
+                      : 'Jadikan Data Saat Ini sebagai Default'}
+                  </span>
+                </button>
                 {confirmResetAll ? (
                   <>
                     <button
                       type="button"
                       disabled={resettingDefaultAll}
-                      onClick={handleResetDefaultAll}
+                      onClick={() => void handleResetDefaultAll(false)}
                       className="inline-flex items-center gap-1.5 rounded-lg bg-red-600 px-3.5 py-2 text-xs font-semibold text-white hover:bg-red-700 disabled:opacity-60"
                     >
                       <RefreshCw
@@ -5940,10 +6046,22 @@ export function AdminDashboard({
                       />
                       <span>
                         {resettingDefaultAll
-                          ? 'Mereset Data...'
-                          : 'Yakin Reset Semua ke Default?'}
+                          ? 'Memulihkan Data...'
+                          : defaultSnapshotInfo?.exists
+                            ? 'Yakin Pulihkan ke Default Import?'
+                            : 'Yakin Reset ke Default Awal?'}
                       </span>
                     </button>
+                    {defaultSnapshotInfo?.exists && (
+                      <button
+                        type="button"
+                        disabled={resettingDefaultAll}
+                        onClick={() => void handleResetDefaultAll(true)}
+                        className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 hover:bg-red-100"
+                      >
+                        Reset Pabrik (Nilai 75)
+                      </button>
+                    )}
                     <button
                       type="button"
                       disabled={resettingDefaultAll}
@@ -5960,7 +6078,11 @@ export function AdminDashboard({
                     className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-800 hover:bg-slate-100"
                   >
                     <RefreshCw className="h-3.5 w-3.5" />
-                    <span>Reset Seluruh Data ke Default</span>
+                    <span>
+                      {defaultSnapshotInfo?.exists
+                        ? 'Pulihkan ke Default Hasil Import'
+                        : 'Reset Seluruh Data ke Default'}
+                    </span>
                   </button>
                 )}
               </div>
@@ -6627,6 +6749,31 @@ export function AdminDashboard({
                     ? `Seluruh ${grades.length} data nilai yang ada saat ini akan dihapus dan diganti oleh ${pendingImport.rows.length} baris dari file.`
                     : `Siswa yang tidak tercantum di file ini akan dihapus beserta nilai & riwayat absensinya. Foto/QR siswa dengan NIS yang sama tetap dipertahankan.`}
                 </div>
+              )}
+
+              {pendingImport.target === 'grades' && (
+                <label className="flex cursor-pointer items-start gap-2.5 rounded-xl border border-emerald-200 bg-emerald-50/70 px-3.5 py-2.5 text-xs text-emerald-950">
+                  <input
+                    type="checkbox"
+                    checked={pendingImport.setAsDefault}
+                    onChange={(e) =>
+                      setPendingImport((prev) =>
+                        prev && prev.target === 'grades'
+                          ? { ...prev, setAsDefault: e.target.checked }
+                          : prev
+                      )
+                    }
+                    className="mt-0.5 h-4 w-4 rounded border-emerald-500 text-emerald-600 focus:ring-emerald-500"
+                  />
+                  <span>
+                    <span className="font-bold">
+                      Jadikan Data Nilai Import ini sebagai Default Portal
+                    </span>
+                    <span className="mt-0.5 block text-[11px] text-emerald-800">
+                      Seluruh nilai hasil import akan disimpan otomatis sebagai data default cadangan di server & disinkronkan ke Cloud agar selalu aman.
+                    </span>
+                  </span>
+                </label>
               )}
 
               <div>

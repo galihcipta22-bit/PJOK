@@ -5,6 +5,7 @@ import type {
   AttendanceMethod,
   AttendanceRecord,
   AttendanceStatus,
+  DefaultSnapshotInfo,
   GradeRecord,
   MaterialCode,
   MaterialDefinition,
@@ -58,6 +59,180 @@ export const DEFAULT_STUDENT_COUNT = 224;
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'pjok-db.json');
+const DB_BACKUP_FILE = path.join(DATA_DIR, 'pjok-db.backup.json');
+const DB_DEFAULT_FILE = path.join(DATA_DIR, 'pjok-db.default.json');
+const MAX_STORED_NOTIFICATIONS = 350;
+
+interface DefaultSnapshotFile {
+  meta: {
+    updatedAt: string;
+    gradesCount: number;
+    studentsCount: number;
+    source: 'import' | 'manual' | 'cloud';
+  };
+  data: DatabaseState;
+}
+
+function pruneNotifications(
+  list: NotificationRecord[] | undefined
+): NotificationRecord[] {
+  if (!Array.isArray(list)) return [];
+  if (list.length <= MAX_STORED_NOTIFICATIONS) return list;
+  return [...list]
+    .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))
+    .slice(0, MAX_STORED_NOTIFICATIONS);
+}
+
+function isValidDatabaseShape(obj: unknown): obj is DatabaseState {
+  if (!obj || typeof obj !== 'object') return false;
+  const candidate = obj as Partial<DatabaseState>;
+  return Boolean(
+    candidate.settings &&
+      typeof candidate.settings === 'object' &&
+      Array.isArray(candidate.students) &&
+      Array.isArray(candidate.grades) &&
+      Array.isArray(candidate.attendance)
+  );
+}
+
+function readDatabaseFileSafe(filePath: string): DatabaseState | null {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, 'utf-8');
+    if (!raw.trim()) return null;
+    const parsed = JSON.parse(raw) as unknown;
+    return isValidDatabaseShape(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function readDefaultSnapshotFileSafe(): DefaultSnapshotFile | null {
+  if (!fs.existsSync(DB_DEFAULT_FILE)) return null;
+  try {
+    const raw = fs.readFileSync(DB_DEFAULT_FILE, 'utf-8');
+    if (!raw.trim()) return null;
+    const parsed = JSON.parse(raw) as Partial<DefaultSnapshotFile>;
+    if (!parsed || !isValidDatabaseShape(parsed.data)) return null;
+    return {
+      meta: {
+        updatedAt: String(parsed.meta?.updatedAt || new Date().toISOString()),
+        gradesCount: Number(parsed.meta?.gradesCount ?? parsed.data.grades.length),
+        studentsCount: Number(
+          parsed.meta?.studentsCount ?? parsed.data.students.length
+        ),
+        source:
+          parsed.meta?.source === 'manual' || parsed.meta?.source === 'cloud'
+            ? parsed.meta.source
+            : 'import',
+      },
+      data: parsed.data,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function applyDbMigrations(dbState: DatabaseState): boolean {
+  let needsMigration = false;
+  if (hasLegacyDefaultMaterials(dbState.materials)) {
+    dbState.materials = PJOK_MATERIALS.map((m) => ({
+      code: m.code,
+      name: m.name,
+    }));
+    dbState.grades = migrateLegacyGrades(dbState.grades);
+    needsMigration = true;
+  } else if (isPrevious7DefaultMaterials(dbState.materials)) {
+    dbState.materials = PJOK_MATERIALS.map((m) => ({
+      code: m.code,
+      name: m.name,
+    }));
+    needsMigration = true;
+  }
+  if (isOldDeterministicSeedGrades(dbState.grades)) {
+    dbState.grades = dbState.grades.map((g) => ({
+      ...g,
+      praktikScore: DEFAULT_SEED_SCORE,
+      pengetahuanScore: DEFAULT_SEED_SCORE,
+      teacherNote: buildAutoGradeDescription(
+        DEFAULT_SEED_SCORE,
+        DEFAULT_SEED_SCORE,
+        g.materialName
+      ),
+      updatedAt: '2026-11-19T08:30:00.000Z',
+    }));
+    needsMigration = true;
+  }
+  if (dbState.settings && !dbState.settings.heroImageUrl) {
+    dbState.settings.heroImageUrl =
+      '/src/assets/images/hero_sports_arena_1794923888842.jpg';
+    needsMigration = true;
+  }
+  if (!Array.isArray(dbState.semesters) || dbState.semesters.length === 0) {
+    const semSet = new Set<string>(DEFAULT_SEMESTERS);
+    dbState.grades.forEach((g) => {
+      if (g.semester) semSet.add(g.semester);
+    });
+    if (dbState.settings?.activeSemester) {
+      semSet.add(dbState.settings.activeSemester);
+    }
+    dbState.semesters = Array.from(semSet);
+    needsMigration = true;
+  }
+  if (!dbState.semesterKkm || typeof dbState.semesterKkm !== 'object') {
+    dbState.semesterKkm = {};
+    needsMigration = true;
+  }
+  for (const sem of dbState.semesters) {
+    if (typeof dbState.semesterKkm[sem] !== 'number') {
+      dbState.semesterKkm[sem] = DEFAULT_KKM;
+      needsMigration = true;
+    }
+  }
+  if (!dbState.classKkm || typeof dbState.classKkm !== 'object') {
+    dbState.classKkm = { ...DEFAULT_CLASS_KKM };
+    for (const sem of dbState.semesters) {
+      if (dbState.semesterKkm[sem] === 75) {
+        dbState.semesterKkm[sem] = DEFAULT_KKM;
+      }
+    }
+    needsMigration = true;
+  } else {
+    const normalizedClassKkm = normalizeClassKkmMap(dbState.classKkm);
+    if (
+      dbState.classKkm['7'] === undefined ||
+      dbState.classKkm['8'] === undefined ||
+      dbState.classKkm['9'] === undefined
+    ) {
+      dbState.classKkm = normalizedClassKkm;
+      needsMigration = true;
+    }
+  }
+  const reconciled = reconcileAllGradesConsistency({
+    students: dbState.students,
+    materials: getAvailableMaterials(dbState),
+    grades: dbState.grades,
+  });
+  if (reconciled.changed) {
+    dbState.grades = reconciled.grades;
+    needsMigration = true;
+  }
+  const strippedAttendance = stripSeedDefaultAttendance(
+    dbState.attendance ?? []
+  );
+  if (strippedAttendance.removedCount > 0) {
+    dbState.attendance = strippedAttendance.attendance;
+    needsMigration = true;
+  }
+  if (
+    Array.isArray(dbState.notifications) &&
+    dbState.notifications.length > MAX_STORED_NOTIFICATIONS
+  ) {
+    dbState.notifications = pruneNotifications(dbState.notifications);
+    needsMigration = true;
+  }
+  return needsMigration;
+}
 
 export function hashSecret(value: string): string {
   return crypto
@@ -553,126 +728,53 @@ export function getDb(): DatabaseState {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      const raw = fs.readFileSync(DB_FILE, 'utf-8');
-      cachedDb = JSON.parse(raw) as DatabaseState;
-      let needsMigration = false;
-      if (
-        isLegacy18SeedStudents(cachedDb.students) &&
-        isOutdatedDefaultMaterials(cachedDb.materials)
-      ) {
-        const fresh = createSeedDatabase();
-        fresh.adminCredentials = cachedDb.adminCredentials;
-        if (cachedDb.settings) {
-          fresh.settings = {
-            ...fresh.settings,
-            ...cachedDb.settings,
-          };
-        }
-        cachedDb = fresh;
-        saveDb(cachedDb);
-        return cachedDb;
+
+  let loaded = readDatabaseFileSafe(DB_FILE);
+  let recoveredFromSecondary = false;
+
+  if (!loaded) {
+    loaded = readDatabaseFileSafe(DB_BACKUP_FILE);
+    if (loaded) {
+      console.warn('Primary DB unavailable/corrupt, recovered from rolling backup.');
+      recoveredFromSecondary = true;
+    }
+  }
+
+  if (!loaded) {
+    const customDefault = readDefaultSnapshotFileSafe();
+    if (customDefault) {
+      loaded = JSON.parse(JSON.stringify(customDefault.data)) as DatabaseState;
+      console.warn('Primary & backup DB unavailable, recovered from custom default snapshot.');
+      recoveredFromSecondary = true;
+    }
+  }
+
+  if (loaded) {
+    if (
+      isLegacy18SeedStudents(loaded.students) &&
+      isOutdatedDefaultMaterials(loaded.materials)
+    ) {
+      const fresh = createSeedDatabase();
+      fresh.adminCredentials = loaded.adminCredentials;
+      if (loaded.settings) {
+        fresh.settings = {
+          ...fresh.settings,
+          ...loaded.settings,
+        };
       }
-      if (hasLegacyDefaultMaterials(cachedDb.materials)) {
-        cachedDb.materials = PJOK_MATERIALS.map((m) => ({
-          code: m.code,
-          name: m.name,
-        }));
-        cachedDb.grades = migrateLegacyGrades(cachedDb.grades);
-        needsMigration = true;
-      } else if (isPrevious7DefaultMaterials(cachedDb.materials)) {
-        cachedDb.materials = PJOK_MATERIALS.map((m) => ({
-          code: m.code,
-          name: m.name,
-        }));
-        needsMigration = true;
-      }
-      if (isOldDeterministicSeedGrades(cachedDb.grades)) {
-        cachedDb.grades = cachedDb.grades.map((g) => ({
-          ...g,
-          praktikScore: DEFAULT_SEED_SCORE,
-          pengetahuanScore: DEFAULT_SEED_SCORE,
-          teacherNote: buildAutoGradeDescription(
-            DEFAULT_SEED_SCORE,
-            DEFAULT_SEED_SCORE,
-            g.materialName
-          ),
-          updatedAt: '2026-11-19T08:30:00.000Z',
-        }));
-        needsMigration = true;
-      }
-      if (cachedDb.settings && !cachedDb.settings.heroImageUrl) {
-        cachedDb.settings.heroImageUrl =
-          '/src/assets/images/hero_sports_arena_1794923888842.jpg';
-        needsMigration = true;
-      }
-      if (!Array.isArray(cachedDb.semesters) || cachedDb.semesters.length === 0) {
-        const semSet = new Set<string>(DEFAULT_SEMESTERS);
-        cachedDb.grades.forEach((g) => {
-          if (g.semester) semSet.add(g.semester);
-        });
-        if (cachedDb.settings?.activeSemester) {
-          semSet.add(cachedDb.settings.activeSemester);
-        }
-        cachedDb.semesters = Array.from(semSet);
-        needsMigration = true;
-      }
-      if (!cachedDb.semesterKkm || typeof cachedDb.semesterKkm !== 'object') {
-        cachedDb.semesterKkm = {};
-        needsMigration = true;
-      }
-      for (const sem of cachedDb.semesters) {
-        if (typeof cachedDb.semesterKkm[sem] !== 'number') {
-          cachedDb.semesterKkm[sem] = DEFAULT_KKM;
-          needsMigration = true;
-        }
-      }
-      if (!cachedDb.classKkm || typeof cachedDb.classKkm !== 'object') {
-        cachedDb.classKkm = { ...DEFAULT_CLASS_KKM };
-        for (const sem of cachedDb.semesters) {
-          if (cachedDb.semesterKkm[sem] === 75) {
-            cachedDb.semesterKkm[sem] = DEFAULT_KKM;
-          }
-        }
-        needsMigration = true;
-      } else {
-        const normalizedClassKkm = normalizeClassKkmMap(cachedDb.classKkm);
-        if (
-          cachedDb.classKkm['7'] === undefined ||
-          cachedDb.classKkm['8'] === undefined ||
-          cachedDb.classKkm['9'] === undefined
-        ) {
-          cachedDb.classKkm = normalizedClassKkm;
-          needsMigration = true;
-        }
-      }
-      const reconciled = reconcileAllGradesConsistency({
-        students: cachedDb.students,
-        materials: getAvailableMaterials(cachedDb),
-        grades: cachedDb.grades,
-      });
-      if (reconciled.changed) {
-        cachedDb.grades = reconciled.grades;
-        needsMigration = true;
-      }
-      const strippedAttendance = stripSeedDefaultAttendance(
-        cachedDb.attendance ?? []
-      );
-      if (strippedAttendance.removedCount > 0) {
-        cachedDb.attendance = strippedAttendance.attendance;
-        needsMigration = true;
-      }
-      if (needsMigration) {
-        saveDb(cachedDb);
-      }
-      return cachedDb;
-    } catch {
-      cachedDb = createSeedDatabase();
+      cachedDb = fresh;
       saveDb(cachedDb);
       return cachedDb;
     }
+
+    cachedDb = loaded;
+    const needsMigration = applyDbMigrations(cachedDb);
+    if (needsMigration || recoveredFromSecondary) {
+      saveDb(cachedDb);
+    }
+    return cachedDb;
   }
+
   cachedDb = createSeedDatabase();
   saveDb(cachedDb);
   return cachedDb;
@@ -682,18 +784,93 @@ export function saveDb(nextDb: DatabaseState): void {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   }
+  if (Array.isArray(nextDb.notifications)) {
+    nextDb.notifications = pruneNotifications(nextDb.notifications);
+  } else {
+    nextDb.notifications = [];
+  }
   cachedDb = nextDb;
+  const serialized = JSON.stringify(nextDb, null, 2);
   const tmpFile = `${DB_FILE}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(nextDb, null, 2), 'utf-8');
+  fs.writeFileSync(tmpFile, serialized, 'utf-8');
+  // Preserve last known valid primary DB into rolling backup before replacing
+  try {
+    if (fs.existsSync(DB_FILE) && fs.statSync(DB_FILE).size > 20) {
+      fs.copyFileSync(DB_FILE, DB_BACKUP_FILE);
+    }
+  } catch {
+    // Do not block primary atomic save if rolling backup copy encounters a transient error
+  }
   fs.renameSync(tmpFile, DB_FILE);
 }
 
-export function resetDatabaseToSeed(): DatabaseState {
+export function getDefaultSnapshotInfo(): DefaultSnapshotInfo {
+  const snap = readDefaultSnapshotFileSafe();
+  if (!snap) {
+    return {
+      exists: false,
+      updatedAt: '',
+      gradesCount: 0,
+      studentsCount: 0,
+    };
+  }
+  return {
+    exists: true,
+    updatedAt: snap.meta.updatedAt,
+    gradesCount: snap.meta.gradesCount,
+    studentsCount: snap.meta.studentsCount,
+    source: snap.meta.source,
+  };
+}
+
+export function saveCustomDefaultSnapshot(
+  dbState: DatabaseState,
+  source: 'import' | 'manual' | 'cloud' = 'import'
+): DefaultSnapshotInfo {
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  const cloned = JSON.parse(JSON.stringify(dbState)) as DatabaseState;
+  cloned.notifications = pruneNotifications(cloned.notifications);
+  const nowIso = new Date().toISOString();
+  const snapshot: DefaultSnapshotFile = {
+    meta: {
+      updatedAt: nowIso,
+      gradesCount: cloned.grades.length,
+      studentsCount: cloned.students.length,
+      source,
+    },
+    data: cloned,
+  };
+  const tmpDefault = `${DB_DEFAULT_FILE}.tmp`;
+  fs.writeFileSync(tmpDefault, JSON.stringify(snapshot, null, 2), 'utf-8');
+  fs.renameSync(tmpDefault, DB_DEFAULT_FILE);
+  return {
+    exists: true,
+    ...snapshot.meta,
+  };
+}
+
+export function resetDatabaseToSeed(
+  forceFactorySeed = false
+): { db: DatabaseState; restoredFromCustomDefault: boolean } {
   const existing = getDb();
+  if (!forceFactorySeed) {
+    const customDefault = readDefaultSnapshotFileSafe();
+    if (customDefault) {
+      const restored = JSON.parse(
+        JSON.stringify(customDefault.data)
+      ) as DatabaseState;
+      restored.adminCredentials = existing.adminCredentials;
+      applyDbMigrations(restored);
+      saveDb(restored);
+      return { db: restored, restoredFromCustomDefault: true };
+    }
+  }
   const fresh = createSeedDatabase();
   fresh.adminCredentials = existing.adminCredentials;
   saveDb(fresh);
-  return fresh;
+  return { db: fresh, restoredFromCustomDefault: false };
 }
 
 export function sanitizeStudent(s: StoredStudent): StudentRecord {

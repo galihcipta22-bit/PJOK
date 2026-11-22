@@ -30,6 +30,7 @@ import { auth } from './lib/firebase.ts';
 import type {
   AdminDashboardPayload,
   AdminStudentSummary,
+  DefaultSnapshotInfo,
   GradeRecord,
   NotificationRecord,
   PublicOverviewResponse,
@@ -37,6 +38,32 @@ import type {
   StudentPortalPayload,
 } from './types.ts';
 import { analyzeTalent, computeFutStats } from './utils/athleteAnalytics.ts';
+
+const PENDING_CLOUD_SYNC_KEY = 'pjok_pending_cloud_sync';
+
+function hasPendingCloudSync(): boolean {
+  try {
+    return localStorage.getItem(PENDING_CLOUD_SYNC_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+function markPendingCloudSync(): void {
+  try {
+    localStorage.setItem(PENDING_CLOUD_SYNC_KEY, '1');
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function clearPendingCloudSync(): void {
+  try {
+    localStorage.removeItem(PENDING_CLOUD_SYNC_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
 
 const FALLBACK_SETTINGS: SchoolSettings = {
   schoolName: 'SMPN 2 Ciamis',
@@ -103,7 +130,11 @@ export default function App() {
   }, []);
 
   const hydrateServerFromCloud = useCallback(
-    async (authToken: string, payload: AdminDashboardPayload) => {
+    async (
+      authToken: string,
+      payload: AdminDashboardPayload,
+      forceOverwrite = false
+    ) => {
       try {
         await fetch('/api/admin/hydrate', {
           method: 'POST',
@@ -111,7 +142,7 @@ export default function App() {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${authToken}`,
           },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({ ...payload, forceOverwrite }),
         });
       } catch (err) {
         console.warn('Server hydrate skipped:', err);
@@ -283,38 +314,56 @@ export default function App() {
         // Immediately show local server data so admin never sees a blank dashboard
         setAdminData(serverPayload);
 
+        const effectiveSyncScope =
+          !syncScope && hasPendingCloudSync() ? 'full' : syncScope;
+
         if (isFirebaseAdminReady()) {
           try {
-            if (syncScope && syncScope !== 'pull') {
+            if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
               let synced: AdminDashboardPayload;
-              if (syncScope === 'config') {
+              if (effectiveSyncScope === 'config') {
                 synced = await syncConfigAndOverviewToCloud(serverPayload);
-              } else if (syncScope === 'attendance') {
+              } else if (effectiveSyncScope === 'attendance') {
                 synced = await syncAttendanceDeltaToCloud(serverPayload);
-              } else if (syncScope === 'students') {
+              } else if (effectiveSyncScope === 'students') {
                 synced = await syncStudentsDeltaToCloud(serverPayload);
               } else {
                 synced = await syncFullDatabaseToCloud(serverPayload);
               }
+              clearPendingCloudSync();
               if (synced && synced.students.length > 0) {
-                await hydrateServerFromCloud(authToken, synced);
-                setAdminData(synced);
+                const syncedWithDefault: AdminDashboardPayload = {
+                  ...synced,
+                  defaultSnapshotInfo:
+                    synced.defaultSnapshotInfo ?? serverPayload.defaultSnapshotInfo,
+                };
+                await hydrateServerFromCloud(authToken, syncedWithDefault, false);
+                setAdminData(syncedWithDefault);
+                void fetchPublicOverview(selectedClass, selectedSemester);
               }
             } else {
               const cloudPayload =
                 await loadAdminDashboardFromCloud(serverPayload);
               if (cloudPayload && cloudPayload.students.length > 0) {
-                const safePayload: AdminDashboardPayload =
-                  cloudPayload.grades.length === 0 &&
+                const safePayload: AdminDashboardPayload = {
+                  ...(cloudPayload.grades.length === 0 &&
                   serverPayload.grades.length > 0
                     ? { ...cloudPayload, grades: serverPayload.grades }
-                    : cloudPayload;
-                await hydrateServerFromCloud(authToken, safePayload);
+                    : cloudPayload),
+                  defaultSnapshotInfo:
+                    cloudPayload.defaultSnapshotInfo ??
+                    serverPayload.defaultSnapshotInfo,
+                };
+                await hydrateServerFromCloud(authToken, safePayload, false);
+                clearPendingCloudSync();
                 setAdminData(safePayload);
                 void fetchPublicOverview(selectedClass, selectedSemester);
               }
             }
           } catch (cloudErr) {
+            if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
+              markPendingCloudSync();
+            }
             const rawMsg =
               cloudErr instanceof Error ? cloudErr.message : String(cloudErr);
             console.warn('Cloud Firestore admin sync fallback:', rawMsg);
@@ -322,7 +371,7 @@ export default function App() {
             setAdminCloudWarning(
               isQuota
                 ? 'Batas kuota harian Cloud Firestore tercapai, sehingga data ditampilkan dari database server lokal. Semua data siswa & nilai tetap aman.'
-                : 'Sinkronisasi Cloud Firestore sementara tertunda. Data ditampilkan dari database server lokal.'
+                : 'Sinkronisasi Cloud Firestore sementara tertunda. Data ditampilkan dari database server lokal dan akan disinkronkan otomatis.'
             );
           }
         }
@@ -402,6 +451,7 @@ export default function App() {
       availableSemesters?: string[];
       replaceAllGrades?: boolean;
       removedGradeIds?: string[];
+      defaultSnapshotInfo?: DefaultSnapshotInfo;
     }) => {
       let nextSnapshot: AdminDashboardPayload | null = null;
       let semestersChanged = false;
@@ -415,6 +465,7 @@ export default function App() {
           availableSemesters,
           replaceAllGrades = false,
           removedGradeIds = [],
+          defaultSnapshotInfo,
         } = mutation;
 
         let nextGrades: GradeRecord[];
@@ -495,6 +546,7 @@ export default function App() {
           grades: nextGrades,
           notifications: nextNotifications,
           availableSemesters: nextSemesters,
+          defaultSnapshotInfo: defaultSnapshotInfo ?? prev.defaultSnapshotInfo,
         };
         return nextSnapshot;
       });
@@ -502,10 +554,12 @@ export default function App() {
       if (nextSnapshot && isFirebaseAdminReady()) {
         const snapshotToSync = nextSnapshot;
         const onSyncOk = () => {
+          clearPendingCloudSync();
           setAdminCloudWarning(null);
           void fetchPublicOverview(selectedClass, selectedSemester);
         };
         const onSyncErr = (err: unknown) => {
+          markPendingCloudSync();
           const rawMsg = err instanceof Error ? err.message : String(err);
           console.warn('Background cloud sync error:', rawMsg);
           const isQuota = /quota|resource-exhausted/i.test(rawMsg);
@@ -515,7 +569,11 @@ export default function App() {
               : 'Sinkronisasi nilai ke Cloud Firestore tertunda. Klik "Cloud Tersinkron" untuk mencoba menyinkronkan ulang.'
           );
         };
-        if (mutation.replaceAllGrades || (mutation.removedGradeIds?.length ?? 0) > 0) {
+        if (
+          mutation.replaceAllGrades ||
+          (mutation.removedGradeIds?.length ?? 0) > 0 ||
+          mutation.savedGrades.length > 45
+        ) {
           void syncFullDatabaseToCloud(snapshotToSync)
             .then(onSyncOk)
             .catch(onSyncErr);
@@ -530,6 +588,8 @@ export default function App() {
             .then(onSyncOk)
             .catch(onSyncErr);
         }
+      } else if (nextSnapshot) {
+        markPendingCloudSync();
       }
     },
     [fetchPublicOverview, selectedClass, selectedSemester]
