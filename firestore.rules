@@ -1,0 +1,433 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 1 / Safety Net: Global default-deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Pillar 3: Reusable hardened helpers
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrapAdminEmail() {
+      return isVerifiedUser() && request.auth.token.email == 'galihcipta22@gmail.com';
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'galihcipta22@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isOptionalString(data, field, maxLen) {
+      return !(field in data) || (data[field] is string && data[field].size() <= maxLen);
+    }
+
+    function isOptionalScore(data, field) {
+      return !(field in data) || data[field] == null || (data[field] is number && data[field] >= 0 && data[field] <= 100);
+    }
+
+    // Entity validation helpers (Pillar 2)
+    function isValidAdminUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'displayName', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'displayName', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.uid == request.auth.uid &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 160 &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAppConfig(data) {
+      return data.keys().hasAll(['id', 'schoolName', 'teacherName', 'activeSemester', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'schoolName', 'teacherName', 'teacherNip', 'schoolAddress',
+          'activeSemester', 'logoUrl', 'heroImageUrl', 'whatsappGatewayUrl', 'whatsappGatewayToken',
+          'socialLinks', 'materials', 'semesters', 'semesterKkm', 'classKkm',
+          'ownerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.schoolName is string && data.schoolName.size() >= 1 && data.schoolName.size() <= 120 &&
+        data.teacherName is string && data.teacherName.size() >= 1 && data.teacherName.size() <= 120 &&
+        isOptionalString(data, 'teacherNip', 64) &&
+        isOptionalString(data, 'schoolAddress', 300) &&
+        data.activeSemester is string && data.activeSemester.size() >= 1 && data.activeSemester.size() <= 64 &&
+        isOptionalString(data, 'logoUrl', 500) &&
+        isOptionalString(data, 'heroImageUrl', 500) &&
+        isOptionalString(data, 'whatsappGatewayUrl', 300) &&
+        isOptionalString(data, 'whatsappGatewayToken', 300) &&
+        (!('socialLinks' in data) || data.socialLinks is map) &&
+        (!('materials' in data) || (data.materials is list && data.materials.size() <= 50 && (data.materials.size() == 0 || data.materials[0] is map))) &&
+        (!('semesters' in data) || (data.semesters is list && data.semesters.size() <= 30 && (data.semesters.size() == 0 || data.semesters[0] is string))) &&
+        (!('semesterKkm' in data) || data.semesterKkm is map) &&
+        (!('classKkm' in data) || data.classKkm is map) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStudent(data) {
+      return data.keys().hasAll(['id', 'nis', 'name', 'className', 'gender', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'nis', 'name', 'className', 'gender', 'rfidUid',
+          'parentName', 'parentWhatsapp', 'photoUrl', 'qrCodeValue', 'qrImageUrl',
+          'primarySportInterest', 'nonAcademicActivity',
+          'ownerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.nis is string && data.nis.size() >= 1 && data.nis.size() <= 32 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 120 &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 32 &&
+        data.gender in ['L', 'P'] &&
+        isOptionalString(data, 'rfidUid', 64) &&
+        isOptionalString(data, 'parentName', 120) &&
+        isOptionalString(data, 'parentWhatsapp', 32) &&
+        isOptionalString(data, 'photoUrl', 500) &&
+        isOptionalString(data, 'qrCodeValue', 200) &&
+        isOptionalString(data, 'qrImageUrl', 500) &&
+        isOptionalString(data, 'primarySportInterest', 80) &&
+        isOptionalString(data, 'nonAcademicActivity', 120) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidGrade(data) {
+      return data.keys().hasAll(['id', 'studentId', 'semester', 'materialCode', 'materialName', 'ownerUid', 'createdAt', 'serverUpdatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'studentId', 'semester', 'materialCode', 'materialName',
+          'praktikScore', 'pengetahuanScore', 'teacherNote', 'remedialDetail', 'updatedAt',
+          'ownerUid', 'createdAt', 'serverUpdatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.studentId) &&
+        data.semester is string && data.semester.size() >= 1 && data.semester.size() <= 64 &&
+        data.materialCode is string && data.materialCode.size() >= 1 && data.materialCode.size() <= 64 &&
+        data.materialName is string && data.materialName.size() >= 1 && data.materialName.size() <= 120 &&
+        isOptionalScore(data, 'praktikScore') &&
+        isOptionalScore(data, 'pengetahuanScore') &&
+        isOptionalString(data, 'teacherNote', 500) &&
+        isOptionalString(data, 'remedialDetail', 500) &&
+        isOptionalString(data, 'updatedAt', 64) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.serverUpdatedAt is timestamp;
+    }
+
+    function isValidAttendance(data) {
+      return data.keys().hasAll(['id', 'studentId', 'date', 'time', 'status', 'method', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'studentId', 'date', 'time', 'status', 'method',
+          'whatsappNotified', 'whatsappMessage', 'whatsappUrl', 'notifiedAt',
+          'ownerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.studentId) &&
+        data.date is string && data.date.size() >= 8 && data.date.size() <= 16 &&
+        data.time is string && data.time.size() >= 4 && data.time.size() <= 16 &&
+        data.status in ['Hadir', 'Terlambat', 'Izin', 'Sakit', 'Alpa'] &&
+        data.method in ['QR_SCAN', 'RFID_TAP', 'NFC_TAP', 'MANUAL'] &&
+        (!('whatsappNotified' in data) || data.whatsappNotified is bool) &&
+        isOptionalString(data, 'whatsappMessage', 800) &&
+        isOptionalString(data, 'whatsappUrl', 1200) &&
+        isOptionalString(data, 'notifiedAt', 64) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidNotification(data) {
+      return data.keys().hasAll(['id', 'studentId', 'targetRole', 'type', 'title', 'message', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly([
+          'id', 'studentId', 'targetRole', 'type', 'title', 'message',
+          'isRead', 'whatsappSent', 'whatsappUrl', 'clientCreatedAt',
+          'ownerUid', 'createdAt', 'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        isValidId(data.studentId) &&
+        data.targetRole in ['student', 'parent', 'all'] &&
+        data.type in ['GRADE_UPDATE', 'PARENT_PROGRESS', 'ATTENDANCE_ALERT'] &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+        data.message is string && data.message.size() >= 1 && data.message.size() <= 800 &&
+        (!('isRead' in data) || data.isRead is bool) &&
+        (!('whatsappSent' in data) || data.whatsappSent is bool) &&
+        isOptionalString(data, 'whatsappUrl', 1200) &&
+        isOptionalString(data, 'clientCreatedAt', 64) &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMediaAsset(data) {
+      return data.keys().hasAll(['id', 'kind', 'mimeType', 'dataUrl', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'kind', 'mimeType', 'dataUrl', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        data.kind in ['photo', 'qr', 'logo', 'hero'] &&
+        data.mimeType is string && data.mimeType.size() >= 3 && data.mimeType.size() <= 64 &&
+        data.dataUrl is string && data.dataUrl.size() >= 10 && data.dataUrl.size() <= 480000 &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidPublicPortalDoc(data) {
+      return data.keys().hasAll(['id', 'overview', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'overview', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        data.overview is map &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStudentReport(data) {
+      return data.keys().hasAll(['id', 'studentId', 'payload', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'studentId', 'payload', 'ownerUid', 'createdAt', 'updatedAt']) &&
+        isValidId(data.id) &&
+        isValidId(data.studentId) &&
+        data.payload is map &&
+        isValidId(data.ownerUid) &&
+        data.ownerUid == request.auth.uid &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Collection 1: /admins/{uid}
+    match /admins/{uid} {
+      allow get: if isValidId(uid) && isVerifiedUser() && (request.auth.uid == uid || isAdmin());
+      allow list: if isAdmin() && resource.data.uid == request.auth.uid;
+      allow create: if isValidId(uid) &&
+        isBootstrapAdminEmail() &&
+        request.auth.uid == uid &&
+        isValidAdminUser(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(uid) &&
+        isAdmin() &&
+        request.auth.uid == uid &&
+        isValidAdminUser(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // Collection 2: /app_config/{configId} (Admin-only, contains settings + curriculum + optional gateway token)
+    match /app_config/{configId} {
+      allow get: if isValidId(configId) && isAdmin();
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(configId) &&
+        isAdmin() &&
+        isValidAppConfig(incoming()) &&
+        incoming().id == configId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(configId) &&
+        isAdmin() &&
+        isValidAppConfig(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'schoolName', 'teacherName', 'teacherNip', 'schoolAddress',
+          'activeSemester', 'logoUrl', 'heroImageUrl', 'whatsappGatewayUrl', 'whatsappGatewayToken',
+          'socialLinks', 'materials', 'semesters', 'semesterKkm', 'classKkm', 'updatedAt'
+        ]);
+      allow delete: if isValidId(configId) && isAdmin();
+    }
+
+    // Collection 3: /students/{studentId} (Admin-only PII isolation)
+    match /students/{studentId} {
+      allow get: if isValidId(studentId) && isAdmin();
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(studentId) &&
+        isAdmin() &&
+        isValidStudent(incoming()) &&
+        incoming().id == studentId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(studentId) &&
+        isAdmin() &&
+        isValidStudent(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'nis', 'name', 'className', 'gender', 'rfidUid',
+          'parentName', 'parentWhatsapp', 'photoUrl', 'qrCodeValue', 'qrImageUrl',
+          'primarySportInterest', 'nonAcademicActivity', 'updatedAt'
+        ]);
+      allow delete: if isValidId(studentId) && isAdmin();
+    }
+
+    // Collection 4: /grades/{gradeId} (Admin-only)
+    match /grades/{gradeId} {
+      allow get: if isValidId(gradeId) && isAdmin();
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(gradeId) &&
+        isAdmin() &&
+        isValidGrade(incoming()) &&
+        incoming().id == gradeId &&
+        exists(/databases/$(database)/documents/students/$(incoming().studentId)) &&
+        incoming().createdAt == request.time &&
+        incoming().serverUpdatedAt == request.time;
+      allow update: if isValidId(gradeId) &&
+        isAdmin() &&
+        isValidGrade(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().studentId == existing().studentId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().serverUpdatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'semester', 'materialCode', 'materialName', 'praktikScore',
+          'pengetahuanScore', 'teacherNote', 'remedialDetail', 'updatedAt', 'serverUpdatedAt'
+        ]);
+      allow delete: if isValidId(gradeId) && isAdmin();
+    }
+
+    // Collection 5: /attendance/{attendanceId} (Admin-only)
+    match /attendance/{attendanceId} {
+      allow get: if isValidId(attendanceId) && isAdmin();
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(attendanceId) &&
+        isAdmin() &&
+        isValidAttendance(incoming()) &&
+        incoming().id == attendanceId &&
+        exists(/databases/$(database)/documents/students/$(incoming().studentId)) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(attendanceId) &&
+        isAdmin() &&
+        isValidAttendance(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().studentId == existing().studentId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly([
+          'date', 'time', 'status', 'method', 'whatsappNotified',
+          'whatsappMessage', 'whatsappUrl', 'notifiedAt', 'updatedAt'
+        ]);
+      allow delete: if isValidId(attendanceId) && isAdmin();
+    }
+
+    // Collection 6: /notifications/{notificationId} (Admin-only)
+    match /notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && isAdmin();
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(notificationId) &&
+        isAdmin() &&
+        isValidNotification(incoming()) &&
+        incoming().id == notificationId &&
+        exists(/databases/$(database)/documents/students/$(incoming().studentId)) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(notificationId) &&
+        isAdmin() &&
+        isValidNotification(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().studentId == existing().studentId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['isRead', 'whatsappSent', 'updatedAt']);
+      allow delete: if isValidId(notificationId) && isAdmin();
+    }
+
+    // Collection 7: /media_assets/{assetId} (Visual assets only: student photos, QR images, logo; no PII; no unauthenticated list)
+    match /media_assets/{assetId} {
+      allow get: if isValidId(assetId);
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(assetId) &&
+        isAdmin() &&
+        isValidMediaAsset(incoming()) &&
+        incoming().id == assetId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(assetId) &&
+        isAdmin() &&
+        isValidMediaAsset(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['kind', 'mimeType', 'dataUrl', 'updatedAt']);
+      allow delete: if isValidId(assetId) && isAdmin();
+    }
+
+    // Collection 8: /public_portal/{docId} (Non-PII aggregated public overview snapshots; no unauthenticated list)
+    match /public_portal/{docId} {
+      allow get: if isValidId(docId);
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(docId) &&
+        isAdmin() &&
+        isValidPublicPortalDoc(incoming()) &&
+        incoming().id == docId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(docId) &&
+        isAdmin() &&
+        isValidPublicPortalDoc(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['overview', 'updatedAt']);
+      allow delete: if isValidId(docId) && isAdmin();
+    }
+
+    // Collection 9: /student_reports/{reportId} (Hashed-NIS non-PII academic report card; no unauthenticated list)
+    match /student_reports/{reportId} {
+      allow get: if isValidId(reportId);
+      allow list: if isAdmin() && resource.data.ownerUid == request.auth.uid;
+      allow create: if isValidId(reportId) &&
+        isAdmin() &&
+        isValidStudentReport(incoming()) &&
+        incoming().id == reportId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(reportId) &&
+        isAdmin() &&
+        isValidStudentReport(incoming()) &&
+        incoming().id == existing().id &&
+        incoming().studentId == existing().studentId &&
+        incoming().ownerUid == existing().ownerUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['payload', 'updatedAt']);
+      allow delete: if isValidId(reportId) && isAdmin();
+    }
+  }
+}

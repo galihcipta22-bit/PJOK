@@ -1,0 +1,10 @@
+{
+  "name": "Portal PJOK SMPN 2 Ciamis",
+  "description": "Sistem Informasi Nilai, Absensi QR & RFID, Kartu Atlet FUT, dan Analitik Bakat PJOK SMPN 2 Ciamis — Galih Cipta Setia, S.Pd.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
