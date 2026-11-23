@@ -2,6 +2,7 @@ import type {
   AttendanceRecord,
   FutCardStats,
   GradeRecord,
+  StudentPortalPayload,
   StudentRecord,
   TalentRecommendation,
 } from '../types.ts';
@@ -908,4 +909,102 @@ export function analyzeTalent(
     summary,
     actionPlan,
   };
+}
+
+export function isFactorySeedGrade(
+  g: Pick<GradeRecord, 'id' | 'updatedAt'>
+): boolean {
+  return (
+    typeof g.id === 'string' &&
+    g.id.startsWith('grd-stu-') &&
+    g.updatedAt === '2026-11-19T08:30:00.000Z'
+  );
+}
+
+function getStudentPayloadSignals(payload: StudentPortalPayload) {
+  const nonSeedGrades = payload.grades.filter(
+    (g) =>
+      !isFactorySeedGrade(g) &&
+      (typeof g.praktikScore === 'number' ||
+        typeof g.pengetahuanScore === 'number')
+  );
+  const anyNumericGrades = payload.grades.filter(
+    (g) =>
+      typeof g.praktikScore === 'number' ||
+      typeof g.pengetahuanScore === 'number'
+  );
+  const gradePool = nonSeedGrades.length > 0 ? nonSeedGrades : anyNumericGrades;
+  let maxGradeTs = 0;
+  for (const g of gradePool) {
+    const ts = g.updatedAt ? Date.parse(g.updatedAt) || 0 : 0;
+    if (ts > maxGradeTs) maxGradeTs = ts;
+  }
+
+  let maxAttTs = 0;
+  for (const a of payload.attendance) {
+    const ts = a.date ? Date.parse(`${a.date}T${a.time || '00:00:00'}`) || 0 : 0;
+    if (ts > maxAttTs) maxAttTs = ts;
+  }
+
+  let maxNotifTs = 0;
+  for (const n of payload.notifications) {
+    const ts = n.createdAt ? Date.parse(n.createdAt) || 0 : 0;
+    if (ts > maxNotifTs) maxNotifTs = ts;
+  }
+
+  return {
+    hasRealGrades: nonSeedGrades.length > 0,
+    realCount: nonSeedGrades.length,
+    totalNumericCount: anyNumericGrades.length,
+    totalCount: payload.grades.length,
+    maxGradeTs,
+    attCount: payload.attendance.length,
+    maxAttTs,
+    maxNotifTs,
+  };
+}
+
+/**
+ * Picks the fresher StudentPortalPayload across server and Cloud Firestore sources.
+ * Prioritizes real non-factory-seed grades and grade update timestamps so stale
+ * attendance/notification timestamps on an unsynced server never override real grades.
+ * Ties break in favor of `primary`.
+ */
+export function pickFresherStudentPayload(
+  primary: StudentPortalPayload | null,
+  secondary: StudentPortalPayload | null
+): StudentPortalPayload | null {
+  if (!primary) return secondary;
+  if (!secondary) return primary;
+
+  const a = getStudentPayloadSignals(primary);
+  const b = getStudentPayloadSignals(secondary);
+
+  if (a.hasRealGrades !== b.hasRealGrades) {
+    return a.hasRealGrades ? primary : secondary;
+  }
+
+  if (a.maxGradeTs > b.maxGradeTs + 1000) return primary;
+  if (b.maxGradeTs > a.maxGradeTs + 1000) return secondary;
+
+  if (a.realCount !== b.realCount) {
+    return a.realCount > b.realCount ? primary : secondary;
+  }
+  if (a.totalNumericCount !== b.totalNumericCount) {
+    return a.totalNumericCount > b.totalNumericCount ? primary : secondary;
+  }
+  if (a.totalCount !== b.totalCount) {
+    return a.totalCount > b.totalCount ? primary : secondary;
+  }
+
+  if (a.attCount !== b.attCount) {
+    return a.attCount > b.attCount ? primary : secondary;
+  }
+  if (a.maxAttTs !== b.maxAttTs) {
+    return a.maxAttTs > b.maxAttTs ? primary : secondary;
+  }
+  if (a.maxNotifTs > b.maxNotifTs + 1000) return primary;
+  if (b.maxNotifTs > a.maxNotifTs + 1000) return secondary;
+
+  return primary;
 }

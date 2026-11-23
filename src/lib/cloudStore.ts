@@ -38,6 +38,7 @@ import {
   computeFutStats,
   extractActiveClasses,
   hasLegacyDefaultMaterials,
+  isFactorySeedGrade,
   isLegacy18SeedStudents,
   isOldDeterministicSeedGrades,
   isOutdatedDefaultMaterials,
@@ -1396,41 +1397,9 @@ export async function syncGradeDeltaToCloud(params: {
       await commitReports(true);
     }
 
-    // 5. Refresh only affected public_portal snapshots ('index' + affected class+semester)
-    const availableClasses = extractActiveClasses(payload.students);
-    const affectedSemesters = Array.from(
-      new Set(
-        dedupedGrades
-          .map((g) => g.semester)
-          .concat(payload.settings.activeSemester ? [payload.settings.activeSemester] : [])
-      )
-    ).filter(Boolean);
-    const affectedClasses = Array.from(
-      new Set([
-        'Semua Kelas',
-        ...affectedStudents.map((s) => s.className).filter(Boolean),
-      ])
-    );
-
-    const snapshotTargets: Array<{ cls: string; sem: string; snapId: string }> =
-      [];
-    for (const cls of affectedClasses) {
-      for (const sem of affectedSemesters) {
-        const hash = await sha256Hex(`${cls}::${sem}`);
-        snapshotTargets.push({ cls, sem, snapId: `ov_${hash.slice(0, 24)}` });
-      }
-    }
-
-    const allPubIds = ['index', ...snapshotTargets.map((t) => t.snapId)];
-    const pubSnaps = await Promise.all(
-      allPubIds.map((id) => getDoc(doc(db, 'public_portal', id)))
-    );
-    const existingPubSet = new Set(
-      pubSnaps.filter((s) => s.exists()).map((s) => s.id)
-    );
-
-    let pubBatch = writeBatch(db);
-    const defaultOverview = computeOverviewSnapshot({
+    // 5. Refresh all public_portal snapshots via diffed stableEqual (unchanged docs cost 0 writes, missing classes self-heal)
+    await upsertPublicPortalSnapshots({
+      ownerUid,
       settings: payload.settings,
       students: payload.students,
       grades: payload.grades,
@@ -1439,61 +1408,7 @@ export async function syncGradeDeltaToCloud(params: {
       semesters: payload.availableSemesters,
       semesterKkm: payload.semesterKkm,
       classKkm,
-      availableClasses,
-      selectedClass: 'Semua Kelas',
-      selectedSemester:
-        payload.settings.activeSemester ||
-        payload.availableSemesters[0] ||
-        '',
     });
-
-    const indexRef = doc(db, 'public_portal', 'index');
-    if (existingPubSet.has('index')) {
-      pubBatch.update(indexRef, {
-        overview: defaultOverview,
-        updatedAt: serverTimestamp(),
-      });
-    } else {
-      pubBatch.set(indexRef, {
-        id: 'index',
-        overview: defaultOverview,
-        ownerUid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-    }
-
-    for (const target of snapshotTargets) {
-      const overview = computeOverviewSnapshot({
-        settings: payload.settings,
-        students: payload.students,
-        grades: payload.grades,
-        attendance: payload.attendance,
-        materials: payload.availableMaterials,
-        semesters: payload.availableSemesters,
-        semesterKkm: payload.semesterKkm,
-        classKkm,
-        availableClasses,
-        selectedClass: target.cls,
-        selectedSemester: target.sem,
-      });
-      const snapRef = doc(db, 'public_portal', target.snapId);
-      if (existingPubSet.has(target.snapId)) {
-        pubBatch.update(snapRef, {
-          overview,
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        pubBatch.set(snapRef, {
-          id: target.snapId,
-          overview,
-          ownerUid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
-    }
-    await withCloudRetry(() => pubBatch.commit(), 'delta_public_portal');
   });
 }
 
@@ -2574,7 +2489,8 @@ async function syncFullDatabaseToCloudInternal(
 }
 
 export async function loadAdminDashboardFromCloud(
-  fallbackPayload: AdminDashboardPayload | null
+  fallbackPayload: AdminDashboardPayload | null,
+  options?: { forcePushAfterMerge?: boolean }
 ): Promise<AdminDashboardPayload | null> {
   await waitForPendingCloudSync();
   const user = auth.currentUser;
@@ -2779,11 +2695,75 @@ export async function loadAdminDashboardFromCloud(
     grades.length === 0 &&
     Boolean(fallbackPayload && fallbackPayload.grades.length > 0);
 
-  // Bidirectional timestamp-aware grade & attendance merge so stale Cloud data never overwrites fresher local server edits
-  let mergedBaseGrades: GradeRecord[] = missingCloudGrades && fallbackPayload
-    ? fallbackPayload.grades
-    : grades;
+  let effectiveRawStudents = rawStudents;
   let localHasFresherData = false;
+
+  const cloudStuById = new Map(effectiveRawStudents.map((s) => [s.id, s]));
+  const cloudStuByNis = new Map(
+    effectiveRawStudents.map((s) => [s.nis.trim(), s])
+  );
+  const localHasOnlySeedGrades =
+    Boolean(fallbackPayload) &&
+    fallbackPayload!.grades.length > 0 &&
+    fallbackPayload!.grades.every((g) => isFactorySeedGrade(g));
+
+  if (
+    fallbackPayload &&
+    fallbackPayload.students.length > 0 &&
+    (!localHasOnlySeedGrades || options?.forcePushAfterMerge)
+  ) {
+    const missingStudents = fallbackPayload.students.filter((localStu) => {
+      const nisKey = localStu.nis.trim();
+      return !cloudStuById.has(localStu.id) && !cloudStuByNis.has(nisKey);
+    });
+    if (missingStudents.length > 0) {
+      effectiveRawStudents = [
+        ...effectiveRawStudents,
+        ...missingStudents.map((s) => ({
+          id: s.id,
+          nis: s.nis,
+          name: s.name,
+          className: s.className,
+          gender: s.gender,
+          rfidUid: s.rfidUid,
+          parentName: s.parentName,
+          parentWhatsapp: s.parentWhatsapp,
+          photoUrl: s.photoUrl,
+          qrCodeValue: s.qrCodeValue,
+          qrImageUrl: s.qrImageUrl,
+          primarySportInterest: s.primarySportInterest,
+          nonAcademicActivity: s.nonAcademicActivity,
+        })),
+      ];
+      missingStudents.forEach((s) => {
+        cloudStuById.set(s.id, s);
+        cloudStuByNis.set(s.nis.trim(), s);
+      });
+      localHasFresherData = true;
+    }
+  }
+
+  const localStuById = new Map(
+    (fallbackPayload?.students ?? []).map((s) => [s.id, s])
+  );
+  const resolveCloudStudentId = (localStudentId: string): string => {
+    if (cloudStuById.has(localStudentId)) return localStudentId;
+    const localStu = localStuById.get(localStudentId);
+    if (localStu) {
+      const matched = cloudStuByNis.get(localStu.nis.trim());
+      if (matched) return matched.id;
+    }
+    return localStudentId;
+  };
+
+  // Bidirectional timestamp-aware grade & attendance merge so stale Cloud data never overwrites fresher local server edits
+  let mergedBaseGrades: GradeRecord[] =
+    missingCloudGrades && fallbackPayload
+      ? fallbackPayload.grades.map((g) => ({
+          ...g,
+          studentId: resolveCloudStudentId(g.studentId),
+        }))
+      : grades;
 
   if (fallbackPayload && !missingCloudGrades && fallbackPayload.grades.length > 0) {
     const parseTs = (iso?: string) => (iso ? Date.parse(iso) || 0 : 0);
@@ -2795,24 +2775,55 @@ export async function loadAdminDashboardFromCloud(
       (max, g) => Math.max(max, parseTs(g.updatedAt)),
       0
     );
+    const cloudHasRealGrades = grades.some((g) => !isFactorySeedGrade(g));
 
+    const cloudGradesPerStuSem = new Map<string, number>();
     const mergedGradeMap = new Map<string, GradeRecord>();
     grades.forEach((g) => {
       mergedGradeMap.set(`${g.studentId}::${g.semester}::${g.materialCode}`, g);
+      const stuSemKey = `${g.studentId}::${g.semester}`;
+      cloudGradesPerStuSem.set(
+        stuSemKey,
+        (cloudGradesPerStuSem.get(stuSemKey) ?? 0) + 1
+      );
     });
 
     for (const localG of fallbackPayload.grades) {
-      const key = `${localG.studentId}::${localG.semester}::${localG.materialCode}`;
+      const localIsSeed = isFactorySeedGrade(localG);
+      if (localIsSeed && cloudHasRealGrades) continue;
+
+      const resolvedStudentId = resolveCloudStudentId(localG.studentId);
+      if (!cloudStuById.has(resolvedStudentId)) continue;
+
+      const candidateG =
+        resolvedStudentId === localG.studentId
+          ? localG
+          : { ...localG, studentId: resolvedStudentId };
+      const key = `${candidateG.studentId}::${candidateG.semester}::${candidateG.materialCode}`;
       const cloudG = mergedGradeMap.get(key);
-      const localTs = parseTs(localG.updatedAt);
+      const localTs = parseTs(candidateG.updatedAt);
       const cloudTs = cloudG ? parseTs(cloudG.updatedAt) : 0;
+      const cloudStuSemCount =
+        cloudGradesPerStuSem.get(
+          `${candidateG.studentId}::${candidateG.semester}`
+        ) ?? 0;
+
       if (!cloudG) {
-        if (localTs > cloudMaxTs || localMaxTs > cloudMaxTs + 2000) {
-          mergedGradeMap.set(key, localG);
+        if (
+          !localIsSeed &&
+          (localTs > cloudMaxTs ||
+            localMaxTs > cloudMaxTs + 2000 ||
+            cloudStuSemCount === 0 ||
+            Boolean(options?.forcePushAfterMerge))
+        ) {
+          mergedGradeMap.set(key, candidateG);
           localHasFresherData = true;
         }
-      } else if (localTs > cloudTs + 1000) {
-        mergedGradeMap.set(key, localG);
+      } else if (
+        (!localIsSeed && isFactorySeedGrade(cloudG)) ||
+        localTs > cloudTs + 1000
+      ) {
+        mergedGradeMap.set(key, candidateG);
         localHasFresherData = true;
       }
     }
@@ -2828,13 +2839,19 @@ export async function loadAdminDashboardFromCloud(
     attendance.forEach((a) => attMap.set(`${a.studentId}::${a.date}`, a));
     let localAttAdded = false;
     for (const localA of fallbackPayload.attendance) {
-      const key = `${localA.studentId}::${localA.date}`;
+      const resolvedStudentId = resolveCloudStudentId(localA.studentId);
+      if (!cloudStuById.has(resolvedStudentId)) continue;
+      const candidateA =
+        resolvedStudentId === localA.studentId
+          ? localA
+          : { ...localA, studentId: resolvedStudentId };
+      const key = `${candidateA.studentId}::${candidateA.date}`;
       const cloudA = attMap.get(key);
       if (
         !cloudA ||
-        `${localA.date} ${localA.time}` > `${cloudA.date} ${cloudA.time}`
+        `${candidateA.date} ${candidateA.time}` > `${cloudA.date} ${cloudA.time}`
       ) {
-        attMap.set(key, localA);
+        attMap.set(key, candidateA);
         localAttAdded = true;
       }
     }
@@ -2865,7 +2882,7 @@ export async function loadAdminDashboardFromCloud(
     : migratedGrades;
 
   const reconciledCloudGrades = reconcileAllGradesConsistency({
-    students: rawStudents,
+    students: effectiveRawStudents,
     materials: availableMaterials,
     grades: baseGrades,
   });
@@ -2874,7 +2891,7 @@ export async function loadAdminDashboardFromCloud(
   const strippedCloudAtt = stripSeedDefaultAttendance(effectiveBaseAttendance);
   const effectiveAttendance = strippedCloudAtt.attendance;
 
-  const students: AdminStudentSummary[] = rawStudents
+  const students: AdminStudentSummary[] = effectiveRawStudents
     .map((stu) => {
       const sGrades = effectiveGrades.filter((g) => g.studentId === stu.id);
       const sAtt = effectiveAttendance.filter((a) => a.studentId === stu.id);
@@ -2917,7 +2934,8 @@ export async function loadAdminDashboardFromCloud(
     defaultSnapshotInfo: fallbackPayload?.defaultSnapshotInfo,
   };
 
-  if (
+  let needsSnapshotHeal = false;
+  const alreadyWillAutoSync =
     rawTeacherNip === LEGACY_TEACHER_NIP ||
     legacyMaterialsDetected ||
     previous7MaterialsDetected ||
@@ -2926,8 +2944,110 @@ export async function loadAdminDashboardFromCloud(
     localHasFresherData ||
     reconciledCloudGrades.changed ||
     strippedCloudAtt.removedCount > 0 ||
-    !hasStoredClassKkm
-  ) {
+    !hasStoredClassKkm ||
+    Boolean(options?.forcePushAfterMerge);
+
+  if (!alreadyWillAutoSync && students.length > 0) {
+    try {
+      const activeSem =
+        settings.activeSemester || availableSemesters[0] || '';
+      const activeClasses = loadedPayload.availableClasses;
+      const pubTargetIds = ['index'];
+      for (const cls of ['Semua Kelas', ...activeClasses]) {
+        const hash = await sha256Hex(`${cls}::${activeSem}`);
+        pubTargetIds.push(`ov_${hash.slice(0, 24)}`);
+      }
+
+      const sampleIndices = Array.from(
+        new Set([
+          0,
+          Math.floor(students.length / 4),
+          Math.floor(students.length / 2),
+          Math.floor((students.length * 3) / 4),
+          students.length - 1,
+        ])
+      ).filter((idx) => idx >= 0 && idx < students.length);
+
+      const sampleStudents = await Promise.all(
+        sampleIndices.map(async (idx) => ({
+          stu: students[idx],
+          reportId: await sha256Hex(`smpn2pjok_${students[idx].nis.trim()}`),
+        }))
+      );
+
+      const [pubSnaps, reportSnaps] = await Promise.all([
+        Promise.all(
+          pubTargetIds.map((id) => getDoc(doc(db, 'public_portal', id)))
+        ),
+        Promise.all(
+          sampleStudents.map(({ reportId }) =>
+            getDoc(doc(db, 'student_reports', reportId))
+          )
+        ),
+      ]);
+
+      for (let i = 0; i < pubSnaps.length; i++) {
+        const snap = pubSnaps[i];
+        if (!snap.exists()) {
+          needsSnapshotHeal = true;
+          break;
+        }
+        if (i === 0) {
+          const ov = snap.data().overview as
+            | { totalStudents?: number; settings?: { activeSemester?: string } }
+            | undefined;
+          if (
+            !ov ||
+            ov.totalStudents !== students.length ||
+            ov.settings?.activeSemester !== activeSem
+          ) {
+            needsSnapshotHeal = true;
+            break;
+          }
+        }
+      }
+
+      if (!needsSnapshotHeal) {
+        for (let i = 0; i < reportSnaps.length; i++) {
+          const snap = reportSnaps[i];
+          const stu = sampleStudents[i].stu;
+          if (!snap.exists()) {
+            needsSnapshotHeal = true;
+            break;
+          }
+          const rep = snap.data().payload as StudentPortalPayload | undefined;
+          const repGrades = Array.isArray(rep?.grades) ? rep.grades : [];
+          const expectedGrades = effectiveGrades.filter(
+            (g) => g.studentId === stu.id
+          );
+          if (
+            !rep ||
+            rep.settings?.activeSemester !== activeSem ||
+            repGrades.length !== expectedGrades.length
+          ) {
+            needsSnapshotHeal = true;
+            break;
+          }
+          const repMaxTs = repGrades.reduce(
+            (m, g) => Math.max(m, g.updatedAt ? Date.parse(g.updatedAt) || 0 : 0),
+            0
+          );
+          const expMaxTs = expectedGrades.reduce(
+            (m, g) => Math.max(m, g.updatedAt ? Date.parse(g.updatedAt) || 0 : 0),
+            0
+          );
+          if (expMaxTs > repMaxTs + 1000) {
+            needsSnapshotHeal = true;
+            break;
+          }
+        }
+      }
+    } catch (probeErr) {
+      console.warn('Cloud snapshot health probe skipped:', probeErr);
+    }
+  }
+
+  if (alreadyWillAutoSync || needsSnapshotHeal) {
     try {
       return await syncFullDatabaseToCloud(loadedPayload);
     } catch (syncErr) {
@@ -2937,4 +3057,12 @@ export async function loadAdminDashboardFromCloud(
   }
 
   return loadedPayload;
+}
+
+export async function syncAdminCloudBidirectional(
+  fallbackPayload: AdminDashboardPayload | null
+): Promise<AdminDashboardPayload | null> {
+  return loadAdminDashboardFromCloud(fallbackPayload, {
+    forcePushAfterMerge: true,
+  });
 }

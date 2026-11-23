@@ -100,13 +100,16 @@ export type AdminRefreshScope =
   | 'config'
   | 'attendance'
   | 'students'
-  | 'pull';
+  | 'pull'
+  | 'sync';
 
 interface AdminDashboardProps {
   token: string;
   payload: AdminDashboardPayload;
   onRefresh: (scope?: AdminRefreshScope) => Promise<void>;
-  onApplyGradeMutations?: (mutation: GradeMutationUpdate) => void;
+  onApplyGradeMutations?: (
+    mutation: GradeMutationUpdate
+  ) => Promise<{ cloudSynced: boolean; warning?: string }>;
   cloudConnected?: boolean;
   cloudWarning?: string | null;
   onDismissCloudWarning?: () => void;
@@ -1111,25 +1114,29 @@ export function AdminDashboard({
         });
         return;
       }
-      setFeedbackBanner({
-        type: 'success',
-        text: 'Nilai & deskripsi otomatis langsung tersimpan dan disamakan.',
-        waUrl: json.notification?.whatsappUrl,
-      });
       const updatedGrades =
         json.savedGrades && json.savedGrades.length > 0
           ? json.savedGrades
           : json.grade
             ? [json.grade]
             : [];
+      let cloudNote = '';
       if (updatedGrades.length > 0 && onApplyGradeMutations) {
-        onApplyGradeMutations({
+        const syncRes = await onApplyGradeMutations({
           savedGrades: updatedGrades,
           createdNotifications: json.notification ? [json.notification] : [],
         });
+        cloudNote = syncRes.cloudSynced
+          ? ' & tersinkron ke Cloud Firestore untuk semua perangkat.'
+          : ' (tersimpan di server lokal; hubungkan Google Cloud di header agar tampil di perangkat lain).';
       } else {
         await onRefresh();
       }
+      setFeedbackBanner({
+        type: 'success',
+        text: `Nilai & deskripsi otomatis langsung tersimpan${cloudNote}`,
+        waUrl: json.notification?.whatsappUrl,
+      });
     } catch (err) {
       setFeedbackBanner({
         type: 'error',
@@ -1185,18 +1192,22 @@ export function AdminDashboard({
         return next;
       });
 
+      let cloudNote = ' & disinkronkan';
       if (json.savedGrades && onApplyGradeMutations) {
-        onApplyGradeMutations({
+        const syncRes = await onApplyGradeMutations({
           savedGrades: json.savedGrades,
           createdNotifications: json.createdNotifications ?? [],
         });
+        cloudNote = syncRes.cloudSynced
+          ? ' & tersinkron ke Cloud Firestore untuk semua perangkat'
+          : ' di server lokal (hubungkan Cloud Google di header agar muncul di perangkat lain)';
       } else {
         await onRefresh();
       }
 
       setFeedbackBanner({
         type: 'success',
-        text: `${json.updatedCount ?? items.length} nilai siswa berhasil disimpan & disinkronkan.`,
+        text: `${json.updatedCount ?? items.length} nilai siswa berhasil disimpan${cloudNote}.`,
         waUrl: json.createdNotifications?.[0]?.whatsappUrl,
       });
     } catch {
@@ -1254,11 +1265,7 @@ export function AdminDashboard({
         });
         return;
       }
-      setFeedbackBanner({
-        type: 'success',
-        text: `Detail materi "${inlineMatEditor.materialName}" untuk ${detailStudent.name} berhasil diperbarui.`,
-        waUrl: json.notification?.whatsappUrl,
-      });
+      const savedMaterialName = inlineMatEditor.materialName;
       setInlineMatEditor(null);
       const updatedGrades =
         json.savedGrades && json.savedGrades.length > 0
@@ -1266,14 +1273,23 @@ export function AdminDashboard({
           : json.grade
             ? [json.grade]
             : [];
+      let cloudSuffix = '.';
       if (updatedGrades.length > 0 && onApplyGradeMutations) {
-        onApplyGradeMutations({
+        const syncRes = await onApplyGradeMutations({
           savedGrades: updatedGrades,
           createdNotifications: json.notification ? [json.notification] : [],
         });
+        cloudSuffix = syncRes.cloudSynced
+          ? ' & tersinkron ke Cloud Firestore.'
+          : ' (tersimpan di server lokal; hubungkan Cloud Google di header agar tampil di perangkat lain).';
       } else {
         await onRefresh();
       }
+      setFeedbackBanner({
+        type: 'success',
+        text: `Detail materi "${savedMaterialName}" untuk ${detailStudent.name} berhasil diperbarui${cloudSuffix}`,
+        waUrl: json.notification?.whatsappUrl,
+      });
     } catch (err) {
       const msg =
         err instanceof Error && err.message !== 'Failed to fetch'
@@ -1304,7 +1320,7 @@ export function AdminDashboard({
         return;
       }
       if (onApplyGradeMutations) {
-        onApplyGradeMutations({
+        await onApplyGradeMutations({
           savedGrades: [],
           removedGradeIds: [id],
         });
@@ -1411,20 +1427,10 @@ export function AdminDashboard({
           });
           return;
         }
-        const defaultSuffix = json.savedAsDefault
-          ? ' Data nilai ini juga otomatis ditetapkan sebagai Default Portal.'
-          : '';
-        const summaryMsg =
-          json.mode === 'replace'
-            ? `Replace seluruh nilai berhasil: ${json.removedCount ?? 0} entri nilai lama diganti dengan ${json.updatedCount ?? 0} data nilai baru (${json.createdStudents ?? 0} siswa baru ditambahkan).${defaultSuffix}`
-            : `Import nilai berhasil & tersinkron: ${json.createdCount ?? 0} nilai baru ditambahkan, ${json.editedCount ?? 0} nilai diperbarui (${json.createdStudents ?? 0} siswa baru).${defaultSuffix}`;
-        setFeedbackBanner({
-          type: 'success',
-          text: summaryMsg,
-        });
         setPendingImport(null);
+        let cloudSynced = false;
         if (json.savedGrades && onApplyGradeMutations) {
-          onApplyGradeMutations({
+          const syncRes = await onApplyGradeMutations({
             savedGrades: json.savedGrades,
             createdStudents: json.createdStudentsList ?? [],
             createdNotifications: json.createdNotifications ?? [],
@@ -1432,9 +1438,24 @@ export function AdminDashboard({
             replaceAllGrades: json.mode === 'replace',
             defaultSnapshotInfo: json.defaultSnapshotInfo,
           });
+          cloudSynced = syncRes.cloudSynced;
         } else {
           await onRefresh();
         }
+        const defaultSuffix = json.savedAsDefault
+          ? ' Data nilai ini juga otomatis ditetapkan sebagai Default Portal.'
+          : '';
+        const cloudSuffix = cloudSynced
+          ? ' Seluruh nilai telah tersinkron ke Cloud Firestore untuk semua perangkat.'
+          : ' Tersimpan di server lokal; klik "Hubungkan Cloud Google" di header agar nilai tampil di perangkat lain.';
+        const summaryMsg =
+          json.mode === 'replace'
+            ? `Replace seluruh nilai berhasil: ${json.removedCount ?? 0} entri nilai lama diganti dengan ${json.updatedCount ?? 0} data nilai baru (${json.createdStudents ?? 0} siswa baru ditambahkan).${defaultSuffix}${cloudSuffix}`
+            : `Import nilai berhasil: ${json.createdCount ?? 0} nilai baru ditambahkan, ${json.editedCount ?? 0} nilai diperbarui (${json.createdStudents ?? 0} siswa baru).${defaultSuffix}${cloudSuffix}`;
+        setFeedbackBanner({
+          type: 'success',
+          text: summaryMsg,
+        });
         return;
       } else {
         const res = await apiFetchWithRetry('/api/admin/students/import', {
@@ -2535,16 +2556,20 @@ export function AdminDashboard({
         });
         return;
       }
+      let cloudSynced = false;
       if (json.grades && onApplyGradeMutations) {
-        onApplyGradeMutations({
+        const syncRes = await onApplyGradeMutations({
           savedGrades: json.grades,
           replaceAllGrades: true,
         });
+        cloudSynced = syncRes.cloudSynced;
+      } else {
+        await onRefresh(cloudConnected ? 'full' : undefined);
+        cloudSynced = Boolean(cloudConnected);
       }
-      await onRefresh(cloudConnected ? 'full' : undefined);
       setFeedbackBanner({
         type: 'success',
-        text: `Sinkronisasi penuh berhasil: ${json.totalGrades ?? json.grades?.length ?? 0} data nilai terverifikasi sama persis dengan nilai yang diinput (${json.removedCount ?? 0} entri lama dibersihkan, ${json.updatedCount ?? 0} entri diselaraskan${cloudConnected ? ' & disinkronkan ke Cloud Firestore' : ''}).`,
+        text: `Sinkronisasi penuh berhasil: ${json.totalGrades ?? json.grades?.length ?? 0} data nilai terverifikasi sama persis dengan nilai yang diinput (${json.removedCount ?? 0} entri lama dibersihkan, ${json.updatedCount ?? 0} entri diselaraskan${cloudSynced ? ' & disinkronkan ke Cloud Firestore' : ' di server lokal — hubungkan Google Cloud untuk semua perangkat'}).`,
       });
     } catch (err) {
       setFeedbackBanner({
@@ -2568,7 +2593,7 @@ export function AdminDashboard({
           await onConnectCloud();
           setFeedbackBanner({
             type: 'success',
-            text: 'Akun Google Admin terhubung & data Cloud Firestore berhasil dimuat agar sinkron di seluruh perangkat.',
+            text: 'Akun Google Admin terhubung & seluruh nilai, kartu atlet, dan rekap kelas berhasil disinkronkan ke Cloud Firestore.',
           });
         }
       } else {
@@ -2576,10 +2601,10 @@ export function AdminDashboard({
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
         }).catch(() => {});
-        await onRefresh('pull');
+        await onRefresh('sync');
         setFeedbackBanner({
           type: 'success',
-          text: 'Data nilai guru, portal siswa, dan dashboard publik berhasil disinkronkan dengan nilai input & Cloud Firestore terbaru.',
+          text: 'Sinkronisasi dua arah Cloud Firestore berhasil: seluruh nilai guru, rapor siswa, dan dashboard publik kini sama di semua perangkat.',
         });
       }
     } catch (err) {
@@ -2804,7 +2829,7 @@ export function AdminDashboard({
             disabled={cloudActionBusy}
             onClick={handleCloudHeaderAction}
             className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-semibold transition-colors whitespace-nowrap shrink-0 ${
-              cloudConnected
+              cloudConnected && !cloudWarning
                 ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25'
                 : 'border-amber-400/50 bg-amber-500/15 text-amber-200 hover:bg-amber-500/25'
             }`}
@@ -2820,7 +2845,9 @@ export function AdminDashboard({
               {cloudActionBusy
                 ? 'Menyinkronkan...'
                 : cloudConnected
-                  ? 'Cloud Tersinkron'
+                  ? cloudWarning
+                    ? 'Sinkronkan Ulang Cloud'
+                    : 'Cloud Tersinkron'
                   : 'Hubungkan Cloud Google'}
             </span>
           </button>

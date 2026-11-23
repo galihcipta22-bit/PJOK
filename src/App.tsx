@@ -1,8 +1,9 @@
 import { onAuthStateChanged } from 'firebase/auth';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AdminDashboard,
   type AdminRefreshScope,
+  type GradeMutationUpdate,
 } from './components/AdminDashboard.tsx';
 import { ErrorBoundary } from './components/ErrorBoundary.tsx';
 import { Footer } from './components/Footer.tsx';
@@ -20,6 +21,7 @@ import {
   signOutFirebase,
   subscribePublicOverviewFromCloud,
   subscribeStudentReportFromCloudByNis,
+  syncAdminCloudBidirectional,
   syncAttendanceDeltaToCloud,
   syncConfigAndOverviewToCloud,
   syncFullDatabaseToCloud,
@@ -29,15 +31,15 @@ import {
 import { auth } from './lib/firebase.ts';
 import type {
   AdminDashboardPayload,
-  AdminStudentSummary,
-  DefaultSnapshotInfo,
-  GradeRecord,
-  NotificationRecord,
   PublicOverviewResponse,
   SchoolSettings,
   StudentPortalPayload,
 } from './types.ts';
-import { analyzeTalent, computeFutStats } from './utils/athleteAnalytics.ts';
+import {
+  analyzeTalent,
+  computeFutStats,
+  pickFresherStudentPayload,
+} from './utils/athleteAnalytics.ts';
 
 const PENDING_CLOUD_SYNC_KEY = 'pjok_pending_cloud_sync';
 
@@ -115,6 +117,8 @@ export default function App() {
   const [adminData, setAdminData] = useState<AdminDashboardPayload | null>(
     null
   );
+  const adminDataRef = useRef<AdminDashboardPayload | null>(null);
+  adminDataRef.current = adminData;
   const [authLoading, setAuthLoading] = useState(false);
   const [adminLoadError, setAdminLoadError] = useState<string | null>(null);
   const [adminCloudWarning, setAdminCloudWarning] = useState<string | null>(
@@ -194,94 +198,60 @@ export default function App() {
     []
   );
 
-  const getStudentPayloadFreshness = useCallback(
-    (payload: StudentPortalPayload | null): number => {
-      if (!payload) return 0;
-      let maxTs = 0;
-      payload.grades.forEach((g) => {
-        const ts = g.updatedAt ? Date.parse(g.updatedAt) || 0 : 0;
-        if (ts > maxTs) maxTs = ts;
-      });
-      payload.notifications.forEach((n) => {
-        const ts = n.createdAt ? Date.parse(n.createdAt) || 0 : 0;
-        if (ts > maxTs) maxTs = ts;
-      });
-      return maxTs;
-    },
-    []
-  );
+  const fetchStudentPortal = useCallback(async (authToken: string) => {
+    setAuthLoading(true);
+    try {
+      const savedNis = sessionStorage.getItem('pjok_student_nis') || '';
+      const isCloudOnlyToken = authToken.startsWith('cloud-student:');
 
-  const fetchStudentPortal = useCallback(
-    async (authToken: string) => {
-      setAuthLoading(true);
-      try {
-        const savedNis = sessionStorage.getItem('pjok_student_nis') || '';
-        const isCloudOnlyToken = authToken.startsWith('cloud-student:');
+      const cloudPromise = savedNis
+        ? getStudentReportFromCloudByNis(savedNis)
+        : Promise.resolve(null);
 
-        const cloudPromise = savedNis
-          ? getStudentReportFromCloudByNis(savedNis)
-          : Promise.resolve(null);
-
-        if (isCloudOnlyToken) {
-          const cloudReport = await cloudPromise;
-          if (cloudReport) {
-            setStudentData(cloudReport);
-            return;
-          }
-          sessionStorage.removeItem('pjok_role');
-          sessionStorage.removeItem('pjok_token');
-          sessionStorage.removeItem('pjok_student_nis');
-          setRole('public');
-          setToken('');
-          return;
-        }
-
-        const [serverRes, cloudReport] = await Promise.all([
-          fetch('/api/student/me', {
-            headers: { Authorization: `Bearer ${authToken}` },
-          }).catch(() => null),
-          cloudPromise,
-        ]);
-
-        if (serverRes && serverRes.ok) {
-          const serverReport = (await serverRes.json()) as StudentPortalPayload;
-          if (!cloudReport) {
-            setStudentData(serverReport);
-            return;
-          }
-          const serverTs = getStudentPayloadFreshness(serverReport);
-          const cloudTs = getStudentPayloadFreshness(cloudReport);
-          const serverDiffers =
-            serverReport.grades.length !== cloudReport.grades.length;
-          // Prefer whichever snapshot has newer edits; tie-break toward live server data
-          if (cloudTs > serverTs && !serverDiffers) {
-            setStudentData(cloudReport);
-          } else if (cloudTs > serverTs + 5000) {
-            setStudentData(cloudReport);
-          } else {
-            setStudentData(serverReport);
-          }
-          return;
-        }
-
+      if (isCloudOnlyToken) {
+        const cloudReport = await cloudPromise;
         if (cloudReport) {
           setStudentData(cloudReport);
           return;
         }
-
         sessionStorage.removeItem('pjok_role');
         sessionStorage.removeItem('pjok_token');
         sessionStorage.removeItem('pjok_student_nis');
         setRole('public');
         setToken('');
-      } catch (err) {
-        console.warn('Student portal fetch failed:', err);
-      } finally {
-        setAuthLoading(false);
+        return;
       }
-    },
-    [getStudentPayloadFreshness]
-  );
+
+      const [serverRes, cloudReport] = await Promise.all([
+        fetch('/api/student/me', {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }).catch(() => null),
+        cloudPromise,
+      ]);
+
+      if (serverRes && serverRes.ok) {
+        const serverReport = (await serverRes.json()) as StudentPortalPayload;
+        const chosen = pickFresherStudentPayload(serverReport, cloudReport);
+        setStudentData(chosen ?? serverReport);
+        return;
+      }
+
+      if (cloudReport) {
+        setStudentData(cloudReport);
+        return;
+      }
+
+      sessionStorage.removeItem('pjok_role');
+      sessionStorage.removeItem('pjok_token');
+      sessionStorage.removeItem('pjok_student_nis');
+      setRole('public');
+      setToken('');
+    } catch (err) {
+      console.warn('Student portal fetch failed:', err);
+    } finally {
+      setAuthLoading(false);
+    }
+  }, []);
 
   const fetchAdminDashboard = useCallback(
     async (
@@ -315,11 +285,25 @@ export default function App() {
         setAdminData(serverPayload);
 
         const effectiveSyncScope =
-          !syncScope && hasPendingCloudSync() ? 'full' : syncScope;
+          !syncScope && hasPendingCloudSync() ? 'sync' : syncScope;
 
         if (isFirebaseAdminReady()) {
           try {
-            if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
+            if (effectiveSyncScope === 'sync') {
+              const synced = await syncAdminCloudBidirectional(serverPayload);
+              clearPendingCloudSync();
+              if (synced && synced.students.length > 0) {
+                const syncedWithDefault: AdminDashboardPayload = {
+                  ...synced,
+                  defaultSnapshotInfo:
+                    synced.defaultSnapshotInfo ??
+                    serverPayload.defaultSnapshotInfo,
+                };
+                await hydrateServerFromCloud(authToken, syncedWithDefault, true);
+                setAdminData(syncedWithDefault);
+                void fetchPublicOverview(selectedClass, selectedSemester);
+              }
+            } else if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
               let synced: AdminDashboardPayload;
               if (effectiveSyncScope === 'config') {
                 synced = await syncConfigAndOverviewToCloud(serverPayload);
@@ -335,9 +319,14 @@ export default function App() {
                 const syncedWithDefault: AdminDashboardPayload = {
                   ...synced,
                   defaultSnapshotInfo:
-                    synced.defaultSnapshotInfo ?? serverPayload.defaultSnapshotInfo,
+                    synced.defaultSnapshotInfo ??
+                    serverPayload.defaultSnapshotInfo,
                 };
-                await hydrateServerFromCloud(authToken, syncedWithDefault, false);
+                await hydrateServerFromCloud(
+                  authToken,
+                  syncedWithDefault,
+                  effectiveSyncScope === 'full'
+                );
                 setAdminData(syncedWithDefault);
                 void fetchPublicOverview(selectedClass, selectedSemester);
               }
@@ -374,6 +363,10 @@ export default function App() {
                 : 'Sinkronisasi Cloud Firestore sementara tertunda. Data ditampilkan dari database server lokal dan akan disinkronkan otomatis.'
             );
           }
+        } else if (hasPendingCloudSync()) {
+          setAdminCloudWarning(
+            'Perubahan data nilai tersimpan di server lokal namun belum tersinkron ke Cloud Firestore karena akun Google Admin belum terhubung. Klik "Hubungkan Cloud Google" agar nilai muncul di semua perangkat.'
+          );
         }
       } catch (err) {
         console.warn('Admin dashboard fetch failed:', err);
@@ -412,13 +405,7 @@ export default function App() {
         return subscribeStudentReportFromCloudByNis(savedNis, (report) => {
           setStudentData((prev) => {
             if (!prev || token.startsWith('cloud-student:')) return report;
-            const prevTs = getStudentPayloadFreshness(prev);
-            const nextTs = getStudentPayloadFreshness(report);
-            if (nextTs > prevTs) return report;
-            if (nextTs === prevTs && report.grades.length >= prev.grades.length) {
-              return report;
-            }
-            return prev;
+            return pickFresherStudentPayload(report, prev) ?? report;
           });
           setAuthLoading(false);
         });
@@ -432,7 +419,6 @@ export default function App() {
     token,
     fetchStudentPortal,
     fetchAdminDashboard,
-    getStudentPayloadFreshness,
   ]);
 
   function handleStudentLoginSuccess(newToken: string, nis: string) {
@@ -444,153 +430,146 @@ export default function App() {
   }
 
   const handleApplyGradeMutations = useCallback(
-    (mutation: {
-      savedGrades: GradeRecord[];
-      createdStudents?: AdminStudentSummary[];
-      createdNotifications?: NotificationRecord[];
-      availableSemesters?: string[];
-      replaceAllGrades?: boolean;
-      removedGradeIds?: string[];
-      defaultSnapshotInfo?: DefaultSnapshotInfo;
-    }) => {
-      let nextSnapshot: AdminDashboardPayload | null = null;
-      let semestersChanged = false;
+    async (
+      mutation: GradeMutationUpdate
+    ): Promise<{ cloudSynced: boolean; warning?: string }> => {
+      const prev = adminDataRef.current;
+      if (!prev) {
+        return { cloudSynced: false };
+      }
 
-      setAdminData((prev) => {
-        if (!prev) return prev;
-        const {
-          savedGrades,
-          createdStudents = [],
-          createdNotifications = [],
-          availableSemesters,
-          replaceAllGrades = false,
-          removedGradeIds = [],
-          defaultSnapshotInfo,
-        } = mutation;
+      const {
+        savedGrades,
+        createdStudents = [],
+        createdNotifications = [],
+        availableSemesters,
+        replaceAllGrades = false,
+        removedGradeIds = [],
+        defaultSnapshotInfo,
+      } = mutation;
 
-        let nextGrades: GradeRecord[];
-        if (replaceAllGrades) {
-          nextGrades = [...savedGrades];
-        } else {
-          const removedSet = new Set(removedGradeIds);
-          const mergedMap = new Map<string, GradeRecord>();
-          prev.grades.forEach((g) => {
-            if (!removedSet.has(g.id)) {
-              mergedMap.set(
-                `${g.studentId}::${g.semester}::${g.materialCode}`,
-                g
-              );
-            }
-          });
-          savedGrades.forEach((g) => {
+      let nextGrades;
+      if (replaceAllGrades) {
+        nextGrades = [...savedGrades];
+      } else {
+        const removedSet = new Set(removedGradeIds);
+        const mergedMap = new Map<string, (typeof savedGrades)[number]>();
+        prev.grades.forEach((g) => {
+          if (!removedSet.has(g.id)) {
             mergedMap.set(
               `${g.studentId}::${g.semester}::${g.materialCode}`,
               g
             );
-          });
-          nextGrades = Array.from(mergedMap.values());
-        }
-
-        const existingStudentIds = new Set(prev.students.map((s) => s.id));
-        const mergedStudentsBase = [
-          ...prev.students,
-          ...createdStudents.filter((s) => !existingStudentIds.has(s.id)),
-        ];
-
-        const affectedStudentIds = new Set<string>([
-          ...savedGrades.map((g) => g.studentId),
-          ...createdStudents.map((s) => s.id),
-        ]);
-        if (removedGradeIds.length > 0) {
-          prev.grades.forEach((g) => {
-            if (removedGradeIds.includes(g.id)) {
-              affectedStudentIds.add(g.studentId);
-            }
-          });
-        }
-
-        const nextStudents = mergedStudentsBase.map((stu) => {
-          if (!replaceAllGrades && !affectedStudentIds.has(stu.id)) {
-            return stu;
           }
-          const sGrades = nextGrades.filter((g) => g.studentId === stu.id);
-          const sAtt = prev.attendance.filter((a) => a.studentId === stu.id);
-          const futStats = computeFutStats(
-            stu,
-            sGrades,
-            sAtt,
-            prev.settings.activeSemester,
-            prev.availableMaterials
-          );
-          const talent = analyzeTalent(stu, sGrades, sAtt, futStats);
-          return { ...stu, futStats, talent };
         });
+        savedGrades.forEach((g) => {
+          mergedMap.set(
+            `${g.studentId}::${g.semester}::${g.materialCode}`,
+            g
+          );
+        });
+        nextGrades = Array.from(mergedMap.values());
+      }
 
-        const nextSemesters =
-          availableSemesters && availableSemesters.length > 0
-            ? availableSemesters
-            : prev.availableSemesters;
-        semestersChanged =
-          nextSemesters.length !== prev.availableSemesters.length ||
-          nextSemesters.some((s, i) => s !== prev.availableSemesters[i]);
+      const existingStudentIds = new Set(prev.students.map((s) => s.id));
+      const mergedStudentsBase = [
+        ...prev.students,
+        ...createdStudents.filter((s) => !existingStudentIds.has(s.id)),
+      ];
 
-        const existingNotifIds = new Set(prev.notifications.map((n) => n.id));
-        const nextNotifications = [
-          ...createdNotifications.filter((n) => !existingNotifIds.has(n.id)),
-          ...prev.notifications,
-        ];
+      const affectedStudentIds = new Set<string>([
+        ...savedGrades.map((g) => g.studentId),
+        ...createdStudents.map((s) => s.id),
+      ]);
+      if (removedGradeIds.length > 0) {
+        prev.grades.forEach((g) => {
+          if (removedGradeIds.includes(g.id)) {
+            affectedStudentIds.add(g.studentId);
+          }
+        });
+      }
 
-        nextSnapshot = {
-          ...prev,
-          students: nextStudents,
-          grades: nextGrades,
-          notifications: nextNotifications,
-          availableSemesters: nextSemesters,
-          defaultSnapshotInfo: defaultSnapshotInfo ?? prev.defaultSnapshotInfo,
-        };
-        return nextSnapshot;
+      const nextStudents = mergedStudentsBase.map((stu) => {
+        if (!replaceAllGrades && !affectedStudentIds.has(stu.id)) {
+          return stu;
+        }
+        const sGrades = nextGrades.filter((g) => g.studentId === stu.id);
+        const sAtt = prev.attendance.filter((a) => a.studentId === stu.id);
+        const futStats = computeFutStats(
+          stu,
+          sGrades,
+          sAtt,
+          prev.settings.activeSemester,
+          prev.availableMaterials
+        );
+        const talent = analyzeTalent(stu, sGrades, sAtt, futStats);
+        return { ...stu, futStats, talent };
       });
 
-      if (nextSnapshot && isFirebaseAdminReady()) {
-        const snapshotToSync = nextSnapshot;
-        const onSyncOk = () => {
+      const nextSemesters =
+        availableSemesters && availableSemesters.length > 0
+          ? availableSemesters
+          : prev.availableSemesters;
+      const semestersChanged =
+        nextSemesters.length !== prev.availableSemesters.length ||
+        nextSemesters.some((s, i) => s !== prev.availableSemesters[i]);
+
+      const existingNotifIds = new Set(prev.notifications.map((n) => n.id));
+      const nextNotifications = [
+        ...createdNotifications.filter((n) => !existingNotifIds.has(n.id)),
+        ...prev.notifications,
+      ];
+
+      const nextSnapshot: AdminDashboardPayload = {
+        ...prev,
+        students: nextStudents,
+        grades: nextGrades,
+        notifications: nextNotifications,
+        availableSemesters: nextSemesters,
+        defaultSnapshotInfo: defaultSnapshotInfo ?? prev.defaultSnapshotInfo,
+      };
+      adminDataRef.current = nextSnapshot;
+      setAdminData(nextSnapshot);
+
+      if (isFirebaseAdminReady()) {
+        try {
+          if (
+            mutation.replaceAllGrades ||
+            (mutation.removedGradeIds?.length ?? 0) > 0 ||
+            mutation.savedGrades.length > 45
+          ) {
+            await syncFullDatabaseToCloud(nextSnapshot);
+          } else {
+            await syncGradeDeltaToCloud({
+              payload: nextSnapshot,
+              savedGrades: mutation.savedGrades,
+              createdStudents: mutation.createdStudents,
+              createdNotifications: mutation.createdNotifications,
+              semestersChanged,
+            });
+          }
           clearPendingCloudSync();
           setAdminCloudWarning(null);
           void fetchPublicOverview(selectedClass, selectedSemester);
-        };
-        const onSyncErr = (err: unknown) => {
+          return { cloudSynced: true };
+        } catch (err) {
           markPendingCloudSync();
           const rawMsg = err instanceof Error ? err.message : String(err);
-          console.warn('Background cloud sync error:', rawMsg);
+          console.warn('Cloud grade sync error:', rawMsg);
           const isQuota = /quota|resource-exhausted/i.test(rawMsg);
-          setAdminCloudWarning(
-            isQuota
-              ? 'Batas kuota harian Cloud Firestore tercapai saat menyinkronkan nilai. Data tetap aman tersimpan di server lokal.'
-              : 'Sinkronisasi nilai ke Cloud Firestore tertunda. Klik "Cloud Tersinkron" untuk mencoba menyinkronkan ulang.'
-          );
-        };
-        if (
-          mutation.replaceAllGrades ||
-          (mutation.removedGradeIds?.length ?? 0) > 0 ||
-          mutation.savedGrades.length > 45
-        ) {
-          void syncFullDatabaseToCloud(snapshotToSync)
-            .then(onSyncOk)
-            .catch(onSyncErr);
-        } else {
-          void syncGradeDeltaToCloud({
-            payload: snapshotToSync,
-            savedGrades: mutation.savedGrades,
-            createdStudents: mutation.createdStudents,
-            createdNotifications: mutation.createdNotifications,
-            semestersChanged,
-          })
-            .then(onSyncOk)
-            .catch(onSyncErr);
+          const warning = isQuota
+            ? 'Batas kuota harian Cloud Firestore tercapai saat menyinkronkan nilai. Data tetap aman tersimpan di server lokal.'
+            : 'Sinkronisasi nilai ke Cloud Firestore tertunda. Klik "Sinkronkan Ulang Cloud" di header untuk menyinkronkan ke semua perangkat.';
+          setAdminCloudWarning(warning);
+          return { cloudSynced: false, warning };
         }
-      } else if (nextSnapshot) {
-        markPendingCloudSync();
       }
+
+      markPendingCloudSync();
+      const offlineWarn =
+        'Nilai tersimpan di server lokal, namun belum tersinkron ke Cloud Firestore karena akun Google Admin belum terhubung. Klik "Hubungkan Cloud Google" agar muncul di perangkat lain.';
+      setAdminCloudWarning(offlineWarn);
+      return { cloudSynced: false, warning: offlineWarn };
     },
     [fetchPublicOverview, selectedClass, selectedSemester]
   );
@@ -619,7 +598,7 @@ export default function App() {
     await signInAdminWithGoogle('Galih Cipta Setia, S.Pd.');
     setCloudAdminConnected(isFirebaseAdminReady());
     if (token) {
-      await fetchAdminDashboard(token, false);
+      await fetchAdminDashboard(token, 'sync');
       await fetchPublicOverview(selectedClass, selectedSemester);
     }
   }

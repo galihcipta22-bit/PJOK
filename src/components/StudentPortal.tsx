@@ -9,7 +9,7 @@ import {
   Trophy,
 } from 'lucide-react';
 import QRCode from 'qrcode';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   CartesianGrid,
   Legend,
@@ -92,7 +92,17 @@ export function StudentPortal({
     };
   }, [student.nis, student.qrImageUrl, student.qrCodeValue]);
 
+  const prevActiveSemesterRef = useRef(settings.activeSemester);
   useEffect(() => {
+    const activeChanged =
+      prevActiveSemesterRef.current !== settings.activeSemester;
+    if (activeChanged) {
+      prevActiveSemesterRef.current = settings.activeSemester;
+      if (settings.activeSemester) {
+        setSelectedSemester(settings.activeSemester);
+        return;
+      }
+    }
     if (
       availableSemesters.length > 0 &&
       !availableSemesters.includes(selectedSemester)
