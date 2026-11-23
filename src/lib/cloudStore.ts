@@ -11,6 +11,7 @@ import {
   updateDoc,
   where,
   writeBatch,
+  type DocumentReference,
   type Unsubscribe,
 } from 'firebase/firestore';
 import { cacheResolvedMedia } from '../components/CloudImage.tsx';
@@ -65,10 +66,77 @@ const LEGACY_TEACHER_NIP = '19920514 201903 1 008';
 const CURRENT_TEACHER_NIP = '19890526 202221 1 006';
 const FIRESTORE_BATCH_LIMIT = 180;
 const REPORT_BATCH_LIMIT = 40;
+const CREATE_WITH_EXISTS_BATCH_LIMIT = 15;
+const BATCH_WAVE_CONCURRENCY = 3;
 const BATCH_PACE_MS = 100;
 
 function pauseBatchPace(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, BATCH_PACE_MS));
+}
+
+function createSmartBatchQueue(
+  label: string,
+  maxOps = FIRESTORE_BATCH_LIMIT,
+  maxCreateWithExists = CREATE_WITH_EXISTS_BATCH_LIMIT
+) {
+  const batches: Array<{
+    batch: ReturnType<typeof writeBatch>;
+    ops: number;
+    createExistsOps: number;
+  }> = [];
+
+  const getActive = (isCreateWithExists: boolean) => {
+    const last = batches[batches.length - 1];
+    if (
+      !last ||
+      last.ops >= maxOps ||
+      (isCreateWithExists && last.createExistsOps >= maxCreateWithExists)
+    ) {
+      const next = { batch: writeBatch(db), ops: 0, createExistsOps: 0 };
+      batches.push(next);
+      return next;
+    }
+    return last;
+  };
+
+  return {
+    addSet(
+      ref: DocumentReference,
+      data: Record<string, unknown>,
+      usesExistsRule = true
+    ) {
+      const entry = getActive(usesExistsRule);
+      entry.batch.set(ref, data);
+      entry.ops += 1;
+      if (usesExistsRule) entry.createExistsOps += 1;
+    },
+    addUpdate(ref: DocumentReference, data: Record<string, unknown>) {
+      const entry = getActive(false);
+      entry.batch.update(ref, data);
+      entry.ops += 1;
+    },
+    addDelete(ref: DocumentReference) {
+      const entry = getActive(false);
+      entry.batch.delete(ref);
+      entry.ops += 1;
+    },
+    async commitAll(waveSize = BATCH_WAVE_CONCURRENCY) {
+      for (let i = 0; i < batches.length; i += waveSize) {
+        const wave = batches.slice(i, i + waveSize);
+        await Promise.all(
+          wave.map((entry, idx) =>
+            withCloudRetry(
+              () => entry.batch.commit(),
+              batches.length > 1 ? `${label}_b${i + idx + 1}` : label
+            )
+          )
+        );
+        if (i + waveSize < batches.length) {
+          await pauseBatchPace();
+        }
+      }
+    },
+  };
 }
 
 function isNonRetryableFirestoreError(err: unknown): boolean {
@@ -1370,16 +1438,7 @@ export async function syncGradeDeltaToCloud(params: {
         snap.docs.forEach((d) => existingGradeDataMap.set(d.id, d.data()));
       }
 
-      let gBatch = writeBatch(db);
-      let gOps = 0;
-      const commitGrades = async (force = false) => {
-        if (gOps >= FIRESTORE_BATCH_LIMIT || (force && gOps > 0)) {
-          await withCloudRetry(() => gBatch.commit(), 'delta_grades_batch');
-          gBatch = writeBatch(db);
-          gOps = 0;
-          if (!force) await pauseBatchPace();
-        }
-      };
+      const gradeQueue = createSmartBatchQueue('delta_grades_batch');
 
       for (const g of dedupedGrades) {
         const gId = sanitizeFirestoreId(g.id, 'grd');
@@ -1412,24 +1471,26 @@ export async function syncGradeDeltaToCloud(params: {
           updatedAt: (g.updatedAt || new Date().toISOString()).slice(0, 64),
         });
         if (existing) {
-          gBatch.update(ref, {
+          gradeQueue.addUpdate(ref, {
             ...gradeFields,
             serverUpdatedAt: serverTimestamp(),
           });
         } else {
-          gBatch.set(ref, {
-            id: gId,
-            studentId: sId,
-            ...gradeFields,
-            ownerUid,
-            createdAt: serverTimestamp(),
-            serverUpdatedAt: serverTimestamp(),
-          });
+          gradeQueue.addSet(
+            ref,
+            {
+              id: gId,
+              studentId: sId,
+              ...gradeFields,
+              ownerUid,
+              createdAt: serverTimestamp(),
+              serverUpdatedAt: serverTimestamp(),
+            },
+            true
+          );
         }
-        gOps += 1;
-        await commitGrades();
       }
-      await commitGrades(true);
+      await gradeQueue.commitAll();
     }
 
     // 3. Insert newly created notifications (capped at newest 40 per bulk burst; check exists so existing IDs don't violate update rule)
@@ -1443,39 +1504,32 @@ export async function syncGradeDeltaToCloud(params: {
         notifSnaps.filter((s) => s.exists()).map((s) => s.id)
       );
 
-      let nBatch = writeBatch(db);
-      let nOps = 0;
-      const commitNotifs = async (force = false) => {
-        if (nOps >= FIRESTORE_BATCH_LIMIT || (force && nOps > 0)) {
-          await withCloudRetry(() => nBatch.commit(), 'delta_notifications_batch');
-          nBatch = writeBatch(db);
-          nOps = 0;
-          if (!force) await pauseBatchPace();
-        }
-      };
+      const notifQueue = createSmartBatchQueue('delta_notifications_batch');
       for (const n of notificationsToSync) {
         const nId = sanitizeFirestoreId(n.id, 'notif');
         const sId = sanitizeFirestoreId(n.studentId, 'stu');
         if (existingNotifIds.has(nId) || !studentByIdMap.has(sId)) continue;
-        nBatch.set(doc(db, 'notifications', nId), {
-          id: nId,
-          studentId: sId,
-          targetRole: n.targetRole || 'all',
-          type: n.type || 'GRADE_UPDATE',
-          title: (n.title || 'Pembaruan').slice(0, 195),
-          message: (n.message || '-').slice(0, 780),
-          isRead: Boolean(n.isRead),
-          whatsappSent: Boolean(n.whatsappSent),
-          whatsappUrl: (n.whatsappUrl || '').slice(0, 1180),
-          clientCreatedAt: n.createdAt || new Date().toISOString(),
-          ownerUid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        nOps += 1;
-        await commitNotifs();
+        notifQueue.addSet(
+          doc(db, 'notifications', nId),
+          {
+            id: nId,
+            studentId: sId,
+            targetRole: n.targetRole || 'all',
+            type: n.type || 'GRADE_UPDATE',
+            title: (n.title || 'Pembaruan').slice(0, 195),
+            message: (n.message || '-').slice(0, 780),
+            isRead: Boolean(n.isRead),
+            whatsappSent: Boolean(n.whatsappSent),
+            whatsappUrl: (n.whatsappUrl || '').slice(0, 1180),
+            clientCreatedAt: n.createdAt || new Date().toISOString(),
+            ownerUid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          true
+        );
       }
-      await commitNotifs(true);
+      await notifQueue.commitAll();
     }
 
     // 4. Refresh only affected student_reports/{nisHash}
@@ -1891,18 +1945,13 @@ export async function syncAttendanceDeltaToCloud(
       .filter((a) => targetStudentIds.has(a.studentId));
     const targetAttIds = new Set(cleanAtt.map((a) => a.id));
 
-    let batch = writeBatch(db);
-    let ops = 0;
-    const commitIfNeeded = async (force = false) => {
-      if (ops >= FIRESTORE_BATCH_LIMIT || (force && ops > 0)) {
-        await withCloudRetry(() => batch.commit(), 'delta_attendance_batch');
-        batch = writeBatch(db);
-        ops = 0;
-      }
-    };
+    const attQueue = createSmartBatchQueue('delta_attendance_batch');
 
     for (const a of cleanAtt) {
       const ref = doc(db, 'attendance', a.id);
+      const existing = existingAttMap.get(a.id);
+      const cleanWaUrl = (a.whatsappUrl || '').slice(0, 1180);
+      const cleanNotifiedAt = (a.notifiedAt || '').slice(0, 64);
       const attFields = {
         date: a.date,
         time: a.time,
@@ -1910,44 +1959,46 @@ export async function syncAttendanceDeltaToCloud(
         method: a.method,
         whatsappNotified: Boolean(a.whatsappNotified),
         whatsappMessage: (a.whatsappMessage || '').slice(0, 780),
-        whatsappUrl: (a.whatsappUrl || '').slice(0, 1180),
-        notifiedAt: a.notifiedAt || '',
+        ...(cleanWaUrl || (existing && 'whatsappUrl' in existing)
+          ? { whatsappUrl: cleanWaUrl }
+          : {}),
+        ...(cleanNotifiedAt || (existing && 'notifiedAt' in existing)
+          ? { notifiedAt: cleanNotifiedAt }
+          : {}),
       };
-      const existing = existingAttMap.get(a.id);
       if (existing) {
         const changed = Object.entries(attFields).some(
           ([k, v]) => !stableEqual(existing[k], v)
         );
         if (changed) {
-          batch.update(ref, { ...attFields, updatedAt: serverTimestamp() });
-          ops += 1;
+          attQueue.addUpdate(ref, { ...attFields, updatedAt: serverTimestamp() });
           affectedStudentIds.add(a.studentId);
-          await commitIfNeeded();
         }
       } else {
-        batch.set(ref, {
-          id: a.id,
-          studentId: a.studentId,
-          ...attFields,
-          ownerUid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        ops += 1;
+        attQueue.addSet(
+          ref,
+          {
+            id: a.id,
+            studentId: a.studentId,
+            ...attFields,
+            ownerUid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          true
+        );
         affectedStudentIds.add(a.studentId);
-        await commitIfNeeded();
       }
     }
     for (const [oldId, oldData] of existingAttMap.entries()) {
       if (!targetAttIds.has(oldId)) {
-        batch.delete(doc(db, 'attendance', oldId));
-        ops += 1;
+        attQueue.addDelete(doc(db, 'attendance', oldId));
         if (typeof oldData.studentId === 'string') {
           affectedStudentIds.add(oldData.studentId);
         }
-        await commitIfNeeded();
       }
     }
+    await attQueue.commitAll();
 
     const existingNotifMap = new Map(
       existingNotifSnap.docs.map((d) => [d.id, d.data()])
@@ -1961,6 +2012,7 @@ export async function syncAttendanceDeltaToCloud(
       .filter((n) => targetStudentIds.has(n.studentId));
     const targetNotifIds = new Set(cleanNotifs.map((n) => n.id));
 
+    const notifQueue = createSmartBatchQueue('delta_att_notifications_batch');
     for (const n of cleanNotifs) {
       const ref = doc(db, 'notifications', n.id);
       const notifFields = {
@@ -1973,42 +2025,43 @@ export async function syncAttendanceDeltaToCloud(
           Boolean(existing.isRead) !== notifFields.isRead ||
           Boolean(existing.whatsappSent) !== notifFields.whatsappSent
         ) {
-          batch.update(ref, { ...notifFields, updatedAt: serverTimestamp() });
-          ops += 1;
+          notifQueue.addUpdate(ref, {
+            ...notifFields,
+            updatedAt: serverTimestamp(),
+          });
           affectedStudentIds.add(n.studentId);
-          await commitIfNeeded();
         }
       } else {
-        batch.set(ref, {
-          id: n.id,
-          studentId: n.studentId,
-          targetRole: n.targetRole || 'all',
-          type: n.type || 'GRADE_UPDATE',
-          title: (n.title || 'Pembaruan').slice(0, 195),
-          message: (n.message || '-').slice(0, 780),
-          ...notifFields,
-          whatsappUrl: (n.whatsappUrl || '').slice(0, 1180),
-          clientCreatedAt: n.createdAt || new Date().toISOString(),
-          ownerUid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        ops += 1;
+        notifQueue.addSet(
+          ref,
+          {
+            id: n.id,
+            studentId: n.studentId,
+            targetRole: n.targetRole || 'all',
+            type: n.type || 'GRADE_UPDATE',
+            title: (n.title || 'Pembaruan').slice(0, 195),
+            message: (n.message || '-').slice(0, 780),
+            ...notifFields,
+            whatsappUrl: (n.whatsappUrl || '').slice(0, 1180),
+            clientCreatedAt: n.createdAt || new Date().toISOString(),
+            ownerUid,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          },
+          true
+        );
         affectedStudentIds.add(n.studentId);
-        await commitIfNeeded();
       }
     }
     for (const [oldId, oldData] of existingNotifMap.entries()) {
       if (!targetNotifIds.has(oldId)) {
-        batch.delete(doc(db, 'notifications', oldId));
-        ops += 1;
+        notifQueue.addDelete(doc(db, 'notifications', oldId));
         if (typeof oldData.studentId === 'string') {
           affectedStudentIds.add(oldData.studentId);
         }
-        await commitIfNeeded();
       }
     }
-    await commitIfNeeded(true);
+    await notifQueue.commitAll();
 
     const affectedStudents = payload.students.filter((s) =>
       affectedStudentIds.has(sanitizeFirestoreId(s.id, 'stu'))
@@ -2169,51 +2222,46 @@ export async function syncStudentsDeltaToCloud(
       const newGrades = payload.grades.filter((g) =>
         addedStudentIds.has(sanitizeFirestoreId(g.studentId, 'stu'))
       );
-      let gBatch = writeBatch(db);
-      let gOps = 0;
-      const commitGrades = async (force = false) => {
-        if (gOps >= FIRESTORE_BATCH_LIMIT || (force && gOps > 0)) {
-          await withCloudRetry(() => gBatch.commit(), 'students_new_grades_batch');
-          gBatch = writeBatch(db);
-          gOps = 0;
-        }
-      };
+      const newGradeQueue = createSmartBatchQueue('students_new_grades_batch');
       for (const g of newGrades) {
         const gId = sanitizeFirestoreId(g.id, 'grd');
         const sId = sanitizeFirestoreId(g.studentId, 'stu');
-        gBatch.set(doc(db, 'grades', gId), {
-          id: gId,
-          studentId: sId,
-          ...stripUndefined({
-            semester: (
-              String(g.semester || '').trim() ||
-              payload.settings.activeSemester ||
-              'Ganjil 2026/2027'
-            ).slice(0, 64),
-            materialCode: (
-              String(g.materialCode || '').trim() || 'ATLETIK'
-            ).slice(0, 64),
-            materialName: (
-              String(g.materialName || '').trim() || 'ATLETIK'
-            ).slice(0, 120),
-            praktikScore:
-              typeof g.praktikScore === 'number' ? g.praktikScore : null,
-            pengetahuanScore:
-              typeof g.pengetahuanScore === 'number'
-                ? g.pengetahuanScore
-                : null,
-            teacherNote: (g.teacherNote || '').slice(0, 495),
-            remedialDetail: (g.remedialDetail || '').slice(0, 495),
-            updatedAt: (g.updatedAt || new Date().toISOString()).slice(0, 64),
-          }),
-          ownerUid,
-          createdAt: serverTimestamp(),
-          serverUpdatedAt: serverTimestamp(),
-        });
-        gOps += 1;
-        await commitGrades();
+        const cleanRemedial = (g.remedialDetail || '').slice(0, 495);
+        newGradeQueue.addSet(
+          doc(db, 'grades', gId),
+          {
+            id: gId,
+            studentId: sId,
+            ...stripUndefined({
+              semester: (
+                String(g.semester || '').trim() ||
+                payload.settings.activeSemester ||
+                'Ganjil 2026/2027'
+              ).slice(0, 64),
+              materialCode: (
+                String(g.materialCode || '').trim() || 'ATLETIK'
+              ).slice(0, 64),
+              materialName: (
+                String(g.materialName || '').trim() || 'ATLETIK'
+              ).slice(0, 120),
+              praktikScore:
+                typeof g.praktikScore === 'number' ? g.praktikScore : null,
+              pengetahuanScore:
+                typeof g.pengetahuanScore === 'number'
+                  ? g.pengetahuanScore
+                  : null,
+              teacherNote: (g.teacherNote || '').slice(0, 495),
+              ...(cleanRemedial ? { remedialDetail: cleanRemedial } : {}),
+              updatedAt: (g.updatedAt || new Date().toISOString()).slice(0, 64),
+            }),
+            ownerUid,
+            createdAt: serverTimestamp(),
+            serverUpdatedAt: serverTimestamp(),
+          },
+          true
+        );
       }
-      await commitGrades(true);
+      await newGradeQueue.commitAll();
     }
 
     const classKkm = normalizeClassKkmMap(payload.classKkm);
@@ -2444,16 +2492,7 @@ async function syncFullDatabaseToCloudInternal(
     .filter((g) => targetStudentIds.has(g.studentId));
   const targetGradeIds = new Set(cleanGrades.map((g) => g.id));
 
-  let batch = writeBatch(db);
-  let ops = 0;
-  const commitBatchIfNeeded = async (force = false) => {
-    if (ops >= FIRESTORE_BATCH_LIMIT || (force && ops > 0)) {
-      await withCloudRetry(() => batch.commit(), 'full_data_batch');
-      batch = writeBatch(db);
-      ops = 0;
-      if (!force) await pauseBatchPace();
-    }
-  };
+  const gradeQueue = createSmartBatchQueue('full_grades_batch');
 
   for (const g of cleanGrades) {
     const ref = doc(db, 'grades', g.id);
@@ -2491,34 +2530,32 @@ async function syncFullDatabaseToCloudInternal(
         ([k, v]) => !stableEqual(existing[k], v)
       );
       if (changed) {
-        batch.update(ref, {
+        gradeQueue.addUpdate(ref, {
           ...gradeFields,
           serverUpdatedAt: serverTimestamp(),
         });
-        ops += 1;
-        await commitBatchIfNeeded();
       }
     } else {
-      batch.set(ref, {
-        id: g.id,
-        studentId: g.studentId,
-        ...gradeFields,
-        ownerUid,
-        createdAt: serverTimestamp(),
-        serverUpdatedAt: serverTimestamp(),
-      });
-      ops += 1;
-      await commitBatchIfNeeded();
+      gradeQueue.addSet(
+        ref,
+        {
+          id: g.id,
+          studentId: g.studentId,
+          ...gradeFields,
+          ownerUid,
+          createdAt: serverTimestamp(),
+          serverUpdatedAt: serverTimestamp(),
+        },
+        true
+      );
     }
   }
   for (const oldId of existingGradeMap.keys()) {
     if (!targetGradeIds.has(oldId)) {
-      batch.delete(doc(db, 'grades', oldId));
-      ops += 1;
-      await commitBatchIfNeeded();
+      gradeQueue.addDelete(doc(db, 'grades', oldId));
     }
   }
-  await commitBatchIfNeeded(true);
+  await gradeQueue.commitAll();
 
   // 5. Sync /attendance (only changed/new/deleted!)
   const existingAttSnap = await getDocs(
@@ -2536,6 +2573,7 @@ async function syncFullDatabaseToCloudInternal(
     .filter((a) => targetStudentIds.has(a.studentId));
   const targetAttIds = new Set(cleanAtt.map((a) => a.id));
 
+  const attQueue = createSmartBatchQueue('full_attendance_batch');
   for (const a of cleanAtt) {
     const ref = doc(db, 'attendance', a.id);
     const existing = existingAttMap.get(a.id);
@@ -2560,31 +2598,29 @@ async function syncFullDatabaseToCloudInternal(
         ([k, v]) => !stableEqual(existing[k], v)
       );
       if (changed) {
-        batch.update(ref, { ...attFields, updatedAt: serverTimestamp() });
-        ops += 1;
-        await commitBatchIfNeeded();
+        attQueue.addUpdate(ref, { ...attFields, updatedAt: serverTimestamp() });
       }
     } else {
-      batch.set(ref, {
-        id: a.id,
-        studentId: a.studentId,
-        ...attFields,
-        ownerUid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      ops += 1;
-      await commitBatchIfNeeded();
+      attQueue.addSet(
+        ref,
+        {
+          id: a.id,
+          studentId: a.studentId,
+          ...attFields,
+          ownerUid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        true
+      );
     }
   }
   for (const oldId of existingAttMap.keys()) {
     if (!targetAttIds.has(oldId)) {
-      batch.delete(doc(db, 'attendance', oldId));
-      ops += 1;
-      await commitBatchIfNeeded();
+      attQueue.addDelete(doc(db, 'attendance', oldId));
     }
   }
-  await commitBatchIfNeeded(true);
+  await attQueue.commitAll();
 
   // 6. Sync /notifications (only changed/new/deleted!)
   const existingNotifSnap = await getDocs(
@@ -2604,6 +2640,7 @@ async function syncFullDatabaseToCloudInternal(
     .filter((n) => targetStudentIds.has(n.studentId));
   const targetNotifIds = new Set(cleanNotifs.map((n) => n.id));
 
+  const notifQueue = createSmartBatchQueue('full_notifications_batch');
   for (const n of cleanNotifs) {
     const ref = doc(db, 'notifications', n.id);
     const notifFields = {
@@ -2616,37 +2653,38 @@ async function syncFullDatabaseToCloudInternal(
         Boolean(existing.isRead) !== notifFields.isRead ||
         Boolean(existing.whatsappSent) !== notifFields.whatsappSent
       ) {
-        batch.update(ref, { ...notifFields, updatedAt: serverTimestamp() });
-        ops += 1;
-        await commitBatchIfNeeded();
+        notifQueue.addUpdate(ref, {
+          ...notifFields,
+          updatedAt: serverTimestamp(),
+        });
       }
     } else {
-      batch.set(ref, {
-        id: n.id,
-        studentId: n.studentId,
-        targetRole: n.targetRole || 'all',
-        type: n.type || 'GRADE_UPDATE',
-        title: (n.title || 'Pembaruan').slice(0, 195),
-        message: (n.message || '-').slice(0, 780),
-        ...notifFields,
-        whatsappUrl: (n.whatsappUrl || '').slice(0, 1180),
-        clientCreatedAt: n.createdAt || new Date().toISOString(),
-        ownerUid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
-      ops += 1;
-      await commitBatchIfNeeded();
+      notifQueue.addSet(
+        ref,
+        {
+          id: n.id,
+          studentId: n.studentId,
+          targetRole: n.targetRole || 'all',
+          type: n.type || 'GRADE_UPDATE',
+          title: (n.title || 'Pembaruan').slice(0, 195),
+          message: (n.message || '-').slice(0, 780),
+          ...notifFields,
+          whatsappUrl: (n.whatsappUrl || '').slice(0, 1180),
+          clientCreatedAt: n.createdAt || new Date().toISOString(),
+          ownerUid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        true
+      );
     }
   }
   for (const oldId of existingNotifMap.keys()) {
     if (!targetNotifIds.has(oldId)) {
-      batch.delete(doc(db, 'notifications', oldId));
-      ops += 1;
-      await commitBatchIfNeeded();
+      notifQueue.addDelete(doc(db, 'notifications', oldId));
     }
   }
-  await commitBatchIfNeeded(true);
+  await notifQueue.commitAll();
 
   // 7. Update /student_reports/{nisHash} in batches (only changed/new/deleted!)
   await syncStudentReportsSubset({
