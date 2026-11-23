@@ -13,6 +13,7 @@ import { PublicDashboard } from './components/PublicDashboard.tsx';
 import { StudentPortal } from './components/StudentPortal.tsx';
 import { WelcomeSplash } from './components/WelcomeSplash.tsx';
 import {
+  formatCloudSyncWarning,
   getPublicOverviewFromCloud,
   getStudentReportFromCloudByNis,
   isFirebaseAdminReady,
@@ -356,12 +357,7 @@ export default function App() {
             const rawMsg =
               cloudErr instanceof Error ? cloudErr.message : String(cloudErr);
             console.warn('Cloud Firestore admin sync fallback:', rawMsg);
-            const isQuota = /quota|resource-exhausted/i.test(rawMsg);
-            setAdminCloudWarning(
-              isQuota
-                ? 'Batas kuota harian Cloud Firestore tercapai, sehingga data ditampilkan dari database server lokal. Semua data siswa & nilai tetap aman.'
-                : 'Sinkronisasi Cloud Firestore sementara tertunda. Data ditampilkan dari database server lokal dan akan disinkronkan otomatis.'
-            );
+            setAdminCloudWarning(formatCloudSyncWarning(rawMsg, 'load'));
           }
         } else if (hasPendingCloudSync()) {
           setAdminCloudWarning(
@@ -556,10 +552,7 @@ export default function App() {
           markPendingCloudSync();
           const rawMsg = err instanceof Error ? err.message : String(err);
           console.warn('Cloud grade sync error:', rawMsg);
-          const isQuota = /quota|resource-exhausted/i.test(rawMsg);
-          const warning = isQuota
-            ? 'Batas kuota harian Cloud Firestore tercapai saat menyinkronkan nilai. Data tetap aman tersimpan di server lokal.'
-            : 'Sinkronisasi nilai ke Cloud Firestore tertunda. Klik "Sinkronkan Ulang Cloud" di header untuk menyinkronkan ke semua perangkat.';
+          const warning = formatCloudSyncWarning(rawMsg, 'grade');
           setAdminCloudWarning(warning);
           return { cloudSynced: false, warning };
         }

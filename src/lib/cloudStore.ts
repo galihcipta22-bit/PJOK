@@ -64,12 +64,25 @@ const DEFAULT_KKM = 78;
 const LEGACY_TEACHER_NIP = '19920514 201903 1 008';
 const CURRENT_TEACHER_NIP = '19890526 202221 1 006';
 const FIRESTORE_BATCH_LIMIT = 180;
+const REPORT_BATCH_LIMIT = 40;
+const BATCH_PACE_MS = 100;
+
+function pauseBatchPace(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, BATCH_PACE_MS));
+}
 
 function isNonRetryableFirestoreError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /permission-denied|insufficient permissions|unauthenticated|resource-exhausted|quota|invalid-argument|not-found|already-exists/i.test(
+  return /permission-denied|insufficient permissions|unauthenticated|resource-exhausted|quota|invalid-argument|unsupported field value|not-found|already-exists/i.test(
     msg
   );
+}
+
+function wrapCloudStageError(err: unknown, label: string): Error {
+  const raw = err instanceof Error ? err.message : String(err);
+  const prefix = `[${label}]`;
+  const msg = raw.includes(prefix) ? raw : `${prefix} ${raw}`;
+  return new Error(msg);
 }
 
 async function withCloudRetry<T>(
@@ -84,15 +97,15 @@ async function withCloudRetry<T>(
     } catch (err) {
       lastError = err;
       if (isNonRetryableFirestoreError(err) || attempt === maxAttempts) {
-        throw err;
+        throw wrapCloudStageError(err, label);
       }
       const msg = err instanceof Error ? err.message : String(err);
       const isTransient =
-        /unavailable|deadline-exceeded|aborted|internal|network|failed to fetch|offline|timeout|reset/i.test(
+        /unavailable|deadline-exceeded|aborted|internal|unknown|cancelled|network|failed to fetch|offline|timeout|reset/i.test(
           msg
         );
       if (!isTransient) {
-        throw err;
+        throw wrapCloudStageError(err, label);
       }
       console.warn(
         `Cloud Firestore transient retry (${attempt}/${maxAttempts}) [${label}]:`,
@@ -101,7 +114,76 @@ async function withCloudRetry<T>(
       await new Promise((resolve) => setTimeout(resolve, 450 * attempt));
     }
   }
-  throw lastError;
+  throw wrapCloudStageError(lastError, label);
+}
+
+export function formatCloudSyncWarning(
+  rawMsg: string,
+  context: 'load' | 'grade'
+): string {
+  let stageTag = '';
+  let coreMsg = (rawMsg || '').trim();
+
+  const bracketMatch = coreMsg.match(/^\[([a-zA-Z0-9_:-]+)\]\s*(.*)$/s);
+  if (bracketMatch) {
+    stageTag = bracketMatch[1];
+    coreMsg = bracketMatch[2].trim();
+  }
+
+  if (coreMsg.startsWith('{') && coreMsg.includes('"error"')) {
+    try {
+      const parsed = JSON.parse(coreMsg) as {
+        error?: unknown;
+        operationType?: unknown;
+        path?: unknown;
+      };
+      if (typeof parsed.error === 'string' && parsed.error.trim()) {
+        const op =
+          typeof parsed.operationType === 'string' ? parsed.operationType : '';
+        const path = typeof parsed.path === 'string' ? parsed.path : '';
+        const parsedStage = [op, path].filter(Boolean).join(' ');
+        if (!stageTag && parsedStage) stageTag = parsedStage;
+        coreMsg = parsed.error.trim();
+      }
+    } catch {
+      // keep raw coreMsg if not valid JSON
+    }
+  }
+
+  const compactCore = coreMsg.replace(/\s+/g, ' ').slice(0, 95);
+  const detailParts = [stageTag ? `[${stageTag}]` : '', compactCore].filter(
+    Boolean
+  );
+  const detailSuffix =
+    detailParts.length > 0 ? ` (Detail: ${detailParts.join(' ')})` : '';
+
+  if (/quota|resource-exhausted/i.test(coreMsg)) {
+    return context === 'load'
+      ? 'Batas kuota harian Cloud Firestore tercapai (reset otomatis keesokan hari), sehingga data ditampilkan dari server lokal. Semua data siswa & nilai tetap aman.'
+      : 'Batas kuota harian Cloud Firestore tercapai saat menyinkronkan nilai (reset otomatis keesokan hari). Data tetap aman tersimpan di server lokal.';
+  }
+
+  if (/permission-denied|insufficient permissions|unauthenticated/i.test(coreMsg)) {
+    return `Izin akun Admin Cloud Firestore ditolak atau sesi Google kedaluwarsa. Klik "Hubungkan Cloud Google" dengan akun ${AUTHORIZED_ADMIN_EMAIL}${detailSuffix}.`;
+  }
+
+  if (/invalid-argument|unsupported field value/i.test(coreMsg)) {
+    return `Format data ditolak Cloud Firestore saat menyinkronkan nilai${detailSuffix}.`;
+  }
+
+  if (
+    /unavailable|deadline-exceeded|timeout|network|failed to fetch|offline|aborted|unknown|cancelled/i.test(
+      coreMsg
+    )
+  ) {
+    return context === 'load'
+      ? `Koneksi atau waktu tunggu Cloud Firestore habis saat menyinkronkan. Klik "Sinkronkan Ulang Cloud" di header untuk mencoba lagi${detailSuffix}.`
+      : `Koneksi ke Cloud Firestore terputus atau timeout saat menyinkronkan nilai. Klik "Sinkronkan Ulang Cloud" di header untuk menyinkronkan ke semua perangkat${detailSuffix}.`;
+  }
+
+  return context === 'load'
+    ? `Sinkronisasi Cloud Firestore sementara tertunda. Data ditampilkan dari database server lokal${detailSuffix}.`
+    : `Sinkronisasi nilai ke Cloud Firestore tertunda. Klik "Sinkronkan Ulang Cloud" di header untuk menyinkronkan ke semua perangkat${detailSuffix}.`;
 }
 
 function clampOptionalScore(val: number | null | undefined): number | null {
@@ -130,6 +212,28 @@ function isPlainObject(val: unknown): val is Record<string, unknown> {
       !Array.isArray(val) &&
       Object.getPrototypeOf(val) === Object.prototype
   );
+}
+
+function sanitizeForFirestore<T>(value: T): T {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'number') {
+    return (Number.isFinite(value) ? value : null) as unknown as T;
+  }
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => item !== undefined)
+      .map((item) => sanitizeForFirestore(item)) as unknown as T;
+  }
+  if (isPlainObject(value)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (v !== undefined) {
+        out[k] = sanitizeForFirestore(v);
+      }
+    }
+    return out as T;
+  }
+  return value;
 }
 
 function stableEqual(a: unknown, b: unknown): boolean {
@@ -675,7 +779,9 @@ function buildStudentReportPayload(params: {
   const activeSemGrades = sGrades.filter((g) => g.semester === activeSem);
   const talent = analyzeTalent(student, activeSemGrades, sAttendance, futStats);
 
-  return {
+  const cleanGrades = sGrades.map((g) => stripUndefined({ ...g }));
+
+  return sanitizeForFirestore({
     student: {
       id: student.id,
       nis: student.nis,
@@ -692,7 +798,7 @@ function buildStudentReportPayload(params: {
       nonAcademicActivity: student.nonAcademicActivity,
     },
     settings: buildPublicSettings(settings, false),
-    grades: sGrades,
+    grades: cleanGrades,
     attendance: sAttendance,
     notifications: sNotifs,
     availableSemesters: semesters,
@@ -704,7 +810,7 @@ function buildStudentReportPayload(params: {
     })),
     futStats,
     talent,
-  };
+  });
 }
 
 function normalizePublicOverview(
@@ -961,19 +1067,21 @@ async function upsertPublicPortalSnapshots(params: {
 
   const availableClasses = extractActiveClasses(students);
 
-  const defaultOverview = computeOverviewSnapshot({
-    settings,
-    students,
-    grades,
-    attendance,
-    materials,
-    semesters,
-    semesterKkm,
-    classKkm,
-    availableClasses,
-    selectedClass: 'Semua Kelas',
-    selectedSemester: settings.activeSemester || semesters[0] || '',
-  });
+  const defaultOverview = sanitizeForFirestore(
+    computeOverviewSnapshot({
+      settings,
+      students,
+      grades,
+      attendance,
+      materials,
+      semesters,
+      semesterKkm,
+      classKkm,
+      availableClasses,
+      selectedClass: 'Semua Kelas',
+      selectedSemester: settings.activeSemester || semesters[0] || '',
+    })
+  );
 
   const existingPublicSnap = await getDocs(
     query(collection(db, 'public_portal'), where('ownerUid', '==', ownerUid))
@@ -987,10 +1095,11 @@ async function upsertPublicPortalSnapshots(params: {
   let pubBatch = writeBatch(db);
   let pubOps = 0;
   const commitPubBatch = async (force = false) => {
-    if (pubOps >= FIRESTORE_BATCH_LIMIT || (force && pubOps > 0)) {
+    if (pubOps >= REPORT_BATCH_LIMIT || (force && pubOps > 0)) {
       await withCloudRetry(() => pubBatch.commit(), 'public_portal_batch');
       pubBatch = writeBatch(db);
       pubOps = 0;
+      if (!force) await pauseBatchPace();
     }
   };
 
@@ -1004,6 +1113,7 @@ async function upsertPublicPortalSnapshots(params: {
         updatedAt: serverTimestamp(),
       });
       pubOps += 1;
+      await commitPubBatch();
     }
   } else {
     pubBatch.set(indexRef, {
@@ -1014,6 +1124,7 @@ async function upsertPublicPortalSnapshots(params: {
       updatedAt: serverTimestamp(),
     });
     pubOps += 1;
+    await commitPubBatch();
   }
 
   // Queue per class+semester snapshots only if changed or new & clean up removed ones
@@ -1024,19 +1135,21 @@ async function upsertPublicPortalSnapshots(params: {
       const hash = await sha256Hex(`${cls}::${sem}`);
       const snapId = `ov_${hash.slice(0, 24)}`;
       targetSnapIds.add(snapId);
-      const overview = computeOverviewSnapshot({
-        settings,
-        students,
-        grades,
-        attendance,
-        materials,
-        semesters,
-        semesterKkm,
-        classKkm,
-        availableClasses,
-        selectedClass: cls,
-        selectedSemester: sem,
-      });
+      const overview = sanitizeForFirestore(
+        computeOverviewSnapshot({
+          settings,
+          students,
+          grades,
+          attendance,
+          materials,
+          semesters,
+          semesterKkm,
+          classKkm,
+          availableClasses,
+          selectedClass: cls,
+          selectedSemester: sem,
+        })
+      );
       const snapRef = doc(db, 'public_portal', snapId);
       const existingSnapData = existingPublicMap.get(snapId);
       if (existingSnapData) {
@@ -1128,93 +1241,133 @@ export async function syncGradeDeltaToCloud(params: {
       );
     }
 
-    // 1. Upsert any newly created students first so Firestore exists() rules pass
-    if (createdStudents.length > 0) {
-      let stuBatch = writeBatch(db);
-      let stuOps = 0;
-      const commitStu = async (force = false) => {
-        if (stuOps >= FIRESTORE_BATCH_LIMIT || (force && stuOps > 0)) {
-          await withCloudRetry(() => stuBatch.commit(), 'delta_students_batch');
-          stuBatch = writeBatch(db);
-          stuOps = 0;
-        }
-      };
-
-      const stuDocs = await Promise.all(
-        createdStudents.map((stu) => {
-          const sId = sanitizeFirestoreId(stu.id, 'stu');
-          return getDoc(doc(db, 'students', sId));
-        })
-      );
-
-      for (let i = 0; i < createdStudents.length; i++) {
-        const stu = createdStudents[i];
-        const sId = sanitizeFirestoreId(stu.id, 'stu');
-        const ref = doc(db, 'students', sId);
-        const stuFields = {
-          nis: String(stu.nis).slice(0, 32),
-          name: String(stu.name).slice(0, 120),
-          className: String(stu.className).slice(0, 32),
-          gender: stu.gender,
-          rfidUid: (stu.rfidUid || '').slice(0, 64),
-          parentName: (stu.parentName || '').slice(0, 120),
-          parentWhatsapp: (stu.parentWhatsapp || '').slice(0, 32),
-          photoUrl: (stu.photoUrl || '').slice(0, 500),
-          qrCodeValue: (stu.qrCodeValue || `SMPN2PJOK:${stu.nis}`).slice(
-            0,
-            200
-          ),
-          qrImageUrl: (stu.qrImageUrl || '').slice(0, 500),
-          primarySportInterest: (stu.primarySportInterest || 'Atletik').slice(
-            0,
-            80
-          ),
-          nonAcademicActivity: (
-            stu.nonAcademicActivity || 'Pramuka Inti'
-          ).slice(0, 120),
-        };
-        if (stuDocs[i]?.exists()) {
-          stuBatch.update(ref, { ...stuFields, updatedAt: serverTimestamp() });
-        } else {
-          stuBatch.set(ref, {
-            id: sId,
-            ...stuFields,
-            ownerUid,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
-        }
-        stuOps += 1;
-        await commitStu();
-      }
-      await commitStu(true);
-    }
-
-    // 2. Upsert only modified/created grades
     const dedupedGrades = Array.from(
       new Map(
         savedGrades.map((g) => [sanitizeFirestoreId(g.id, 'grd'), g])
       ).values()
     );
+    const notificationsToSync = createdNotifications.slice(0, 40);
 
+    // 1. Ensure ALL students referenced by createdStudents, dedupedGrades, and notifications exist in Cloud /students first so Firestore exists() rules pass
+    const referencedStudentIds = new Set<string>([
+      ...createdStudents.map((s) => sanitizeFirestoreId(s.id, 'stu')),
+      ...dedupedGrades.map((g) => sanitizeFirestoreId(g.studentId, 'stu')),
+      ...notificationsToSync.map((n) => sanitizeFirestoreId(n.studentId, 'stu')),
+    ]);
+    const studentByIdMap = new Map<string, AdminStudentSummary>();
+    payload.students.forEach((s) =>
+      studentByIdMap.set(sanitizeFirestoreId(s.id, 'stu'), s)
+    );
+    createdStudents.forEach((s) =>
+      studentByIdMap.set(sanitizeFirestoreId(s.id, 'stu'), s)
+    );
+    const createdStudentIdSet = new Set(
+      createdStudents.map((s) => sanitizeFirestoreId(s.id, 'stu'))
+    );
+
+    if (referencedStudentIds.size > 0) {
+      const existingStuMap = new Map<string, boolean>();
+      const refIds = Array.from(referencedStudentIds);
+      if (refIds.length <= 25) {
+        const snaps = await Promise.all(
+          refIds.map((sId) => getDoc(doc(db, 'students', sId)))
+        );
+        snaps.forEach((s) => existingStuMap.set(s.id, s.exists()));
+      } else {
+        const snap = await getDocs(
+          query(collection(db, 'students'), where('ownerUid', '==', ownerUid))
+        ).catch((err) =>
+          handleFirestoreError(err, OperationType.LIST, 'students')
+        );
+        snap.docs.forEach((d) => existingStuMap.set(d.id, true));
+      }
+
+      const studentsToUpsert = refIds
+        .filter((sId) => createdStudentIdSet.has(sId) || !existingStuMap.get(sId))
+        .map((sId) => studentByIdMap.get(sId))
+        .filter((s): s is AdminStudentSummary => Boolean(s));
+
+      if (studentsToUpsert.length > 0) {
+        let stuBatch = writeBatch(db);
+        let stuOps = 0;
+        const commitStu = async (force = false) => {
+          if (stuOps >= FIRESTORE_BATCH_LIMIT || (force && stuOps > 0)) {
+            await withCloudRetry(() => stuBatch.commit(), 'delta_students_batch');
+            stuBatch = writeBatch(db);
+            stuOps = 0;
+            if (!force) await pauseBatchPace();
+          }
+        };
+
+        for (const stu of studentsToUpsert) {
+          const sId = sanitizeFirestoreId(stu.id, 'stu');
+          const ref = doc(db, 'students', sId);
+          const safeNis = (String(stu.nis || sId).trim() || sId).slice(0, 32);
+          const stuFields = {
+            nis: safeNis,
+            name: (String(stu.name || '').trim() || `Siswa ${safeNis}`).slice(
+              0,
+              120
+            ),
+            className: (String(stu.className || '').trim() || 'VII A').slice(
+              0,
+              32
+            ),
+            gender: stu.gender === 'P' ? 'P' : 'L',
+            rfidUid: (stu.rfidUid || '').slice(0, 64),
+            parentName: (stu.parentName || '').slice(0, 120),
+            parentWhatsapp: (stu.parentWhatsapp || '').slice(0, 32),
+            photoUrl: (stu.photoUrl || '').slice(0, 500),
+            qrCodeValue: (stu.qrCodeValue || `SMPN2PJOK:${safeNis}`).slice(
+              0,
+              200
+            ),
+            qrImageUrl: (stu.qrImageUrl || '').slice(0, 500),
+            primarySportInterest: (stu.primarySportInterest || 'Atletik').slice(
+              0,
+              80
+            ),
+            nonAcademicActivity: (
+              stu.nonAcademicActivity || 'Pramuka Inti'
+            ).slice(0, 120),
+          };
+          if (existingStuMap.get(sId)) {
+            stuBatch.update(ref, { ...stuFields, updatedAt: serverTimestamp() });
+          } else {
+            stuBatch.set(ref, {
+              id: sId,
+              ...stuFields,
+              ownerUid,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          }
+          stuOps += 1;
+          await commitStu();
+        }
+        await commitStu(true);
+      }
+    }
+
+    // 2. Upsert only modified/created grades
     if (dedupedGrades.length > 0) {
-      let existingGradeIds: Set<string>;
+      const existingGradeDataMap = new Map<string, Record<string, unknown>>();
       if (dedupedGrades.length <= 25) {
         const snaps = await Promise.all(
           dedupedGrades.map((g) =>
             getDoc(doc(db, 'grades', sanitizeFirestoreId(g.id, 'grd')))
           )
         );
-        existingGradeIds = new Set(
-          snaps.filter((s) => s.exists()).map((s) => s.id)
-        );
+        snaps.forEach((s) => {
+          if (s.exists()) existingGradeDataMap.set(s.id, s.data());
+        });
       } else {
         const snap = await getDocs(
           query(collection(db, 'grades'), where('ownerUid', '==', ownerUid))
         ).catch((err) =>
           handleFirestoreError(err, OperationType.LIST, 'grades')
         );
-        existingGradeIds = new Set(snap.docs.map((d) => d.id));
+        snap.docs.forEach((d) => existingGradeDataMap.set(d.id, d.data()));
       }
 
       let gBatch = writeBatch(db);
@@ -1224,24 +1377,41 @@ export async function syncGradeDeltaToCloud(params: {
           await withCloudRetry(() => gBatch.commit(), 'delta_grades_batch');
           gBatch = writeBatch(db);
           gOps = 0;
+          if (!force) await pauseBatchPace();
         }
       };
 
       for (const g of dedupedGrades) {
         const gId = sanitizeFirestoreId(g.id, 'grd');
         const sId = sanitizeFirestoreId(g.studentId, 'stu');
+        if (!studentByIdMap.has(sId)) continue;
         const ref = doc(db, 'grades', gId);
+        const existing = existingGradeDataMap.get(gId);
+        const cleanRemedial = (g.remedialDetail || '').slice(0, 495);
+        const safeSemester = (
+          String(g.semester || '').trim() ||
+          payload.settings.activeSemester ||
+          'Ganjil 2026/2027'
+        ).slice(0, 64);
+        const safeMatCode = (
+          String(g.materialCode || '').trim() || 'ATLETIK'
+        ).slice(0, 64);
+        const safeMatName = (
+          String(g.materialName || '').trim() || safeMatCode
+        ).slice(0, 120);
         const gradeFields = stripUndefined({
-          semester: String(g.semester).slice(0, 64),
-          materialCode: String(g.materialCode).slice(0, 64),
-          materialName: String(g.materialName).slice(0, 120),
+          semester: safeSemester,
+          materialCode: safeMatCode,
+          materialName: safeMatName,
           praktikScore: clampOptionalScore(g.praktikScore),
           pengetahuanScore: clampOptionalScore(g.pengetahuanScore),
           teacherNote: (g.teacherNote || '').slice(0, 495),
-          remedialDetail: (g.remedialDetail || '').slice(0, 495),
+          ...(cleanRemedial || (existing && 'remedialDetail' in existing)
+            ? { remedialDetail: cleanRemedial }
+            : {}),
           updatedAt: (g.updatedAt || new Date().toISOString()).slice(0, 64),
         });
-        if (existingGradeIds.has(gId)) {
+        if (existing) {
           gBatch.update(ref, {
             ...gradeFields,
             serverUpdatedAt: serverTimestamp(),
@@ -1262,9 +1432,17 @@ export async function syncGradeDeltaToCloud(params: {
       await commitGrades(true);
     }
 
-    // 3. Insert newly created notifications (capped at newest 40 per bulk burst; student_reports retains full per-student logs)
-    if (createdNotifications.length > 0) {
-      const notificationsToSync = createdNotifications.slice(0, 40);
+    // 3. Insert newly created notifications (capped at newest 40 per bulk burst; check exists so existing IDs don't violate update rule)
+    if (notificationsToSync.length > 0) {
+      const notifSnaps = await Promise.all(
+        notificationsToSync.map((n) =>
+          getDoc(doc(db, 'notifications', sanitizeFirestoreId(n.id, 'notif')))
+        )
+      );
+      const existingNotifIds = new Set(
+        notifSnaps.filter((s) => s.exists()).map((s) => s.id)
+      );
+
       let nBatch = writeBatch(db);
       let nOps = 0;
       const commitNotifs = async (force = false) => {
@@ -1272,11 +1450,13 @@ export async function syncGradeDeltaToCloud(params: {
           await withCloudRetry(() => nBatch.commit(), 'delta_notifications_batch');
           nBatch = writeBatch(db);
           nOps = 0;
+          if (!force) await pauseBatchPace();
         }
       };
       for (const n of notificationsToSync) {
         const nId = sanitizeFirestoreId(n.id, 'notif');
         const sId = sanitizeFirestoreId(n.studentId, 'stu');
+        if (existingNotifIds.has(nId) || !studentByIdMap.has(sId)) continue;
         nBatch.set(doc(db, 'notifications', nId), {
           id: nId,
           studentId: sId,
@@ -1308,11 +1488,13 @@ export async function syncGradeDeltaToCloud(params: {
     );
 
     if (affectedStudents.length > 0) {
-      const cleanGrades = payload.grades.map((g) => ({
-        ...g,
-        id: sanitizeFirestoreId(g.id, 'grd'),
-        studentId: sanitizeFirestoreId(g.studentId, 'stu'),
-      }));
+      const cleanGrades = payload.grades.map((g) =>
+        stripUndefined({
+          ...g,
+          id: sanitizeFirestoreId(g.id, 'grd'),
+          studentId: sanitizeFirestoreId(g.studentId, 'stu'),
+        })
+      );
       const cleanAtt = payload.attendance.map((a) => ({
         ...a,
         id: sanitizeFirestoreId(a.id, 'att'),
@@ -1345,6 +1527,8 @@ export async function syncGradeDeltaToCloud(params: {
             collection(db, 'student_reports'),
             where('ownerUid', '==', ownerUid)
           )
+        ).catch((err) =>
+          handleFirestoreError(err, OperationType.LIST, 'student_reports')
         );
         existingReportIds = new Set(snap.docs.map((d) => d.id));
       }
@@ -1352,10 +1536,11 @@ export async function syncGradeDeltaToCloud(params: {
       let rBatch = writeBatch(db);
       let rOps = 0;
       const commitReports = async (force = false) => {
-        if (rOps >= FIRESTORE_BATCH_LIMIT || (force && rOps > 0)) {
+        if (rOps >= REPORT_BATCH_LIMIT || (force && rOps > 0)) {
           await withCloudRetry(() => rBatch.commit(), 'delta_student_reports_batch');
           rBatch = writeBatch(db);
           rOps = 0;
+          if (!force) await pauseBatchPace();
         }
       };
 
@@ -1364,17 +1549,19 @@ export async function syncGradeDeltaToCloud(params: {
           ...stu,
           id: sanitizeFirestoreId(stu.id, 'stu'),
         };
-        const reportPayload = buildStudentReportPayload({
-          student: safeStu,
-          settings: payload.settings,
-          grades: cleanGrades,
-          attendance: cleanAtt,
-          notifications: cleanNotifs,
-          semesters: payload.availableSemesters,
-          semesterKkm: payload.semesterKkm,
-          classKkm,
-          materials: payload.availableMaterials,
-        });
+        const reportPayload = sanitizeForFirestore(
+          buildStudentReportPayload({
+            student: safeStu,
+            settings: payload.settings,
+            grades: cleanGrades,
+            attendance: cleanAtt,
+            notifications: cleanNotifs,
+            semesters: payload.availableSemesters,
+            semesterKkm: payload.semesterKkm,
+            classKkm,
+            materials: payload.availableMaterials,
+          })
+        );
         const reportRef = doc(db, 'student_reports', rId);
         if (existingReportIds.has(rId)) {
           rBatch.update(reportRef, {
@@ -1486,25 +1673,28 @@ async function syncStudentReportsSubset(params: {
   let batch = writeBatch(db);
   let ops = 0;
   const commitIfNeeded = async (force = false) => {
-    if (ops >= FIRESTORE_BATCH_LIMIT || (force && ops > 0)) {
+    if (ops >= REPORT_BATCH_LIMIT || (force && ops > 0)) {
       await withCloudRetry(() => batch.commit(), 'student_reports_subset');
       batch = writeBatch(db);
       ops = 0;
+      if (!force) await pauseBatchPace();
     }
   };
 
   for (const { stu, rId } of reportTargets) {
-    const reportPayload = buildStudentReportPayload({
-      student: stu,
-      settings,
-      grades: cleanGrades,
-      attendance: cleanAtt,
-      notifications: cleanNotifs,
-      semesters,
-      semesterKkm,
-      classKkm,
-      materials,
-    });
+    const reportPayload = sanitizeForFirestore(
+      buildStudentReportPayload({
+        student: stu,
+        settings,
+        grades: cleanGrades,
+        attendance: cleanAtt,
+        notifications: cleanNotifs,
+        semesters,
+        semesterKkm,
+        classKkm,
+        materials,
+      })
+    );
     const reportRef = doc(db, 'student_reports', rId);
     const existing = existingReportMap.get(rId);
     if (existing) {
@@ -2261,11 +2451,13 @@ async function syncFullDatabaseToCloudInternal(
       await withCloudRetry(() => batch.commit(), 'full_data_batch');
       batch = writeBatch(db);
       ops = 0;
+      if (!force) await pauseBatchPace();
     }
   };
 
   for (const g of cleanGrades) {
     const ref = doc(db, 'grades', g.id);
+    const existing = existingGradeMap.get(g.id);
     const clampOptional = (val: number | null | undefined): number | null =>
       typeof val === 'number' && Number.isFinite(val)
         ? Math.max(0, Math.min(100, Math.round(val)))
@@ -2281,6 +2473,7 @@ async function syncFullDatabaseToCloudInternal(
     const safeMatName = (
       String(g.materialName || '').trim() || safeMatCode
     ).slice(0, 120);
+    const cleanRemedial = (g.remedialDetail || '').slice(0, 495);
     const gradeFields = stripUndefined({
       semester: safeSemester,
       materialCode: safeMatCode,
@@ -2288,10 +2481,11 @@ async function syncFullDatabaseToCloudInternal(
       praktikScore: clampOptional(g.praktikScore),
       pengetahuanScore: clampOptional(g.pengetahuanScore),
       teacherNote: (g.teacherNote || '').slice(0, 495),
-      remedialDetail: (g.remedialDetail || '').slice(0, 495),
+      ...(cleanRemedial || (existing && 'remedialDetail' in existing)
+        ? { remedialDetail: cleanRemedial }
+        : {}),
       updatedAt: (g.updatedAt || new Date().toISOString()).slice(0, 64),
     });
-    const existing = existingGradeMap.get(g.id);
     if (existing) {
       const changed = Object.entries(gradeFields).some(
         ([k, v]) => !stableEqual(existing[k], v)
@@ -2344,6 +2538,9 @@ async function syncFullDatabaseToCloudInternal(
 
   for (const a of cleanAtt) {
     const ref = doc(db, 'attendance', a.id);
+    const existing = existingAttMap.get(a.id);
+    const cleanWaUrl = (a.whatsappUrl || '').slice(0, 1180);
+    const cleanNotifiedAt = (a.notifiedAt || '').slice(0, 64);
     const attFields = {
       date: a.date,
       time: a.time,
@@ -2351,10 +2548,13 @@ async function syncFullDatabaseToCloudInternal(
       method: a.method,
       whatsappNotified: Boolean(a.whatsappNotified),
       whatsappMessage: (a.whatsappMessage || '').slice(0, 780),
-      whatsappUrl: (a.whatsappUrl || '').slice(0, 1180),
-      notifiedAt: a.notifiedAt || '',
+      ...(cleanWaUrl || (existing && 'whatsappUrl' in existing)
+        ? { whatsappUrl: cleanWaUrl }
+        : {}),
+      ...(cleanNotifiedAt || (existing && 'notifiedAt' in existing)
+        ? { notifiedAt: cleanNotifiedAt }
+        : {}),
     };
-    const existing = existingAttMap.get(a.id);
     if (existing) {
       const changed = Object.entries(attFields).some(
         ([k, v]) => !stableEqual(existing[k], v)
@@ -2538,6 +2738,9 @@ export async function loadAdminDashboardFromCloud(
     try {
       return await syncFullDatabaseToCloud(fallbackPayload);
     } catch (syncErr) {
+      if (options?.forcePushAfterMerge) {
+        throw syncErr;
+      }
       console.warn('Initial cloud student seed failed, using local DB:', syncErr);
       return fallbackPayload;
     }
@@ -2994,11 +3197,17 @@ export async function loadAdminDashboardFromCloud(
         }
         if (i === 0) {
           const ov = snap.data().overview as
-            | { totalStudents?: number; settings?: { activeSemester?: string } }
+            | {
+                totalStudents?: number;
+                summary?: { totalStudents?: number };
+                settings?: { activeSemester?: string };
+              }
             | undefined;
+          const ovTotalStudents =
+            ov?.summary?.totalStudents ?? ov?.totalStudents;
           if (
             !ov ||
-            ov.totalStudents !== students.length ||
+            ovTotalStudents !== students.length ||
             ov.settings?.activeSemester !== activeSem
           ) {
             needsSnapshotHeal = true;
@@ -3051,6 +3260,9 @@ export async function loadAdminDashboardFromCloud(
     try {
       return await syncFullDatabaseToCloud(loadedPayload);
     } catch (syncErr) {
+      if (options?.forcePushAfterMerge) {
+        throw syncErr;
+      }
       console.warn('Cloud migration sync skipped, returning loaded data:', syncErr);
       return loadedPayload;
     }
