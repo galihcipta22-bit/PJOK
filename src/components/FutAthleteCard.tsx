@@ -198,7 +198,7 @@ export function FutAthleteCard({
             {student.name}
           </h3>
           <p className={`mt-0.5 text-xs font-medium ${tierTheme.subtext}`}>
-            Kelas {student.className} · NIS {student.nis}
+            Kelas {student.className} · NISN {student.nis}
           </p>
           <div className={`mx-auto mt-3 h-px w-full ${tierTheme.divider}`} />
         </div>
@@ -319,7 +319,7 @@ export function FutAthleteCard({
                 {student.name}
               </p>
               <p className="mt-0.5 text-[11px] leading-snug text-slate-200">
-                Kelas {student.className} · NIS {student.nis} · Kehadiran {futStats.attendanceRate}%.
+                Kelas {student.className} · NISN {student.nis} · Kehadiran {futStats.attendanceRate}%.
               </p>
             </>
           )}

@@ -694,7 +694,7 @@ function createSeedDatabase(): DatabaseState {
       whatsappSent: true,
       whatsappUrl: buildWhatsappUrl(
         student.parentWhatsapp,
-        `[SMPN 2 Ciamis - Progres PJOK] Yth. ${student.parentName}, nilai terbaru PJOK ananda ${student.name} (${student.className}) Semester Ganjil 2026/2027 telah diperbarui oleh Galih Cipta Setia, S.Pd. Silakan pantau melalui Portal PJOK menggunakan NIS ${student.nis}.`
+        `[SMPN 2 Ciamis - Progres PJOK] Yth. ${student.parentName}, nilai terbaru PJOK ananda ${student.name} (${student.className}) Semester Ganjil 2026/2027 telah diperbarui oleh Galih Cipta Setia, S.Pd. Silakan pantau melalui Portal PJOK menggunakan NISN ${student.nis}.`
       ),
       createdAt: '2026-11-16T09:15:00.000Z',
     });

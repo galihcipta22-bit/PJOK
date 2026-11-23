@@ -344,7 +344,7 @@ export function StudentPortal({
               {student.name}
             </h1>
             <p className="mt-1 text-xs text-slate-500 font-mono tabular-nums">
-              NIS {student.nis} · Kelas {student.className} · Guru: {settings.teacherName}
+              NISN {student.nis} · Kelas {student.className} · Guru: {settings.teacherName}
             </p>
           </div>
 
@@ -1126,7 +1126,7 @@ export function StudentPortal({
             )}
             <div className="min-w-0 space-y-1 text-xs">
               <p className="font-semibold text-slate-900 truncate">{student.name}</p>
-              <p className="font-mono text-slate-600 tabular-nums">NIS: {student.nis}</p>
+              <p className="font-mono text-slate-600 tabular-nums">NISN: {student.nis}</p>
               <p className="flex items-center gap-1.5 font-mono text-slate-600">
                 <CreditCard className="h-3.5 w-3.5 text-emerald-600" />
                 <span>RFID: {student.rfidUid}</span>

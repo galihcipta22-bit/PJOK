@@ -55,7 +55,10 @@ export function LoginModal({
         return;
       }
 
-      setError(json.error || 'Nomor Induk Siswa (NIS) tidak ditemukan.');
+      setError(
+        json.error ||
+          'Nomor Induk Siswa Nasional (NISN) tidak ditemukan.'
+      );
     } catch {
       const cloudReport = await getStudentReportFromCloudByNis(cleanNis);
       if (cloudReport) {
@@ -131,7 +134,7 @@ export function LoginModal({
               Akses Akun Portal PJOK
             </h2>
             <p className="text-xs text-slate-500">
-              SMPN 2 Ciamis · Masuk dengan NIS Siswa atau ID Guru
+              SMPN 2 Ciamis · Masuk dengan NISN Siswa atau ID Guru
             </p>
           </div>
           <button
@@ -160,7 +163,7 @@ export function LoginModal({
               }`}
             >
               <UserCheck className="h-4 w-4" />
-              <span>Siswa (NIS)</span>
+              <span>Siswa (NISN)</span>
             </button>
             <button
               type="button"
@@ -194,7 +197,7 @@ export function LoginModal({
                   htmlFor="student-nis"
                   className="block text-xs font-semibold text-slate-700"
                 >
-                  Nomor Induk Siswa (NIS)
+                  Nomor Induk Siswa Nasional (NISN)
                 </label>
                 <input
                   id="student-nis"
@@ -203,7 +206,7 @@ export function LoginModal({
                   autoFocus
                   value={nis}
                   onChange={(e) => setNis(e.target.value)}
-                  placeholder="Masukkan NIS Anda (contoh: 242507001)"
+                  placeholder="Masukkan NISN Anda (contoh: 0123456789)"
                   className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm text-slate-900 focus:border-emerald-600 focus:outline-none"
                 />
               </div>
@@ -213,7 +216,7 @@ export function LoginModal({
                 disabled={loading}
                 className="w-full rounded-lg bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-700 disabled:opacity-60"
               >
-                {loading ? 'Memeriksa NIS...' : 'Masuk ke Rapor & Kartu Atlet'}
+                {loading ? 'Memeriksa NISN...' : 'Masuk ke Rapor & Kartu Atlet'}
               </button>
             </form>
           ) : (

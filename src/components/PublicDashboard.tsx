@@ -133,7 +133,7 @@ export function PublicDashboard({
               Pantau grafik capaian akademik, perkembangan nilai praktik dan
               pengetahuan per semester, serta evaluasi kelas secara transparan.
               Demi privasi akademik, detail nilai per siswa hanya dapat diakses
-              setelah masuk menggunakan Nomor Induk Siswa (NIS).
+              setelah masuk menggunakan Nomor Induk Siswa Nasional (NISN).
             </p>
           </div>
 
@@ -143,7 +143,7 @@ export function PublicDashboard({
               onClick={() => onOpenLogin('student')}
               className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 whitespace-nowrap shrink-0"
             >
-              <span>Masuk dengan NIS Siswa</span>
+              <span>Masuk dengan NISN Siswa</span>
               <ArrowUpRight className="h-4 w-4" />
             </button>
             <button
@@ -669,13 +669,13 @@ export function PublicDashboard({
 
       {/* Protected Individual Student Access CTA */}
       <section
-        id="akses-nis"
+        id="akses-nisn"
         className="mt-8 flex flex-col items-start justify-between gap-6 rounded-2xl border border-slate-200 bg-slate-900 p-6 text-white sm:flex-row sm:items-center sm:p-8"
       >
         <div className="max-w-2xl">
           <div className="flex items-center gap-2 text-xs font-medium text-emerald-400">
             <Lock className="h-4 w-4" />
-            <span>Akses Privasi Siswa Terlindungi NIS</span>
+            <span>Akses Privasi Siswa Terlindungi NISN</span>
           </div>
           <h2 className="mt-2 font-display text-2xl font-bold tracking-tight">
             Lihat Rapor Nilai Spesifik, Kartu Profil Siswa (FUT), & Rekomendasi Bakat
@@ -684,7 +684,7 @@ export function PublicDashboard({
             Untuk menjaga kerahasiaan data pribadi siswa, rincian nilai materi
             praktik & pengetahuan per individu, riwayat kehadiran QR/RFID, serta
             notifikasi pembaruan nilai dari Bapak {settings.teacherName} hanya
-            ditampilkan setelah login menggunakan Nomor Induk Siswa (NIS).
+            ditampilkan setelah login menggunakan Nomor Induk Siswa Nasional (NISN).
           </p>
         </div>
         <button
@@ -692,7 +692,7 @@ export function PublicDashboard({
           onClick={() => onOpenLogin('student')}
           className="inline-flex items-center gap-2 rounded-lg bg-emerald-500 px-5 py-3 text-sm font-semibold text-slate-950 transition-colors hover:bg-emerald-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400 whitespace-nowrap shrink-0"
         >
-          <span>Login Siswa (NIS)</span>
+          <span>Login Siswa (NISN)</span>
           <ArrowUpRight className="h-4 w-4" />
         </button>
       </section>

@@ -165,7 +165,7 @@ export function generateMonthlyPdfReport(params: {
     head: [
       [
         'No',
-        'NIS',
+        'NISN',
         'Nama Siswa',
         'Kelas',
         'Praktik',

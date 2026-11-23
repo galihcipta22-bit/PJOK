@@ -12,7 +12,7 @@ import {
 } from './gradeDescription.ts';
 
 export interface GradeExportRow {
-  NIS: string;
+  NISN: string;
   Nama_Siswa: string;
   Kelas: string;
   Semester: string;
@@ -132,7 +132,7 @@ export function buildGradeExportRows({
           null;
 
         rows.push({
-          NIS: stu.nis,
+          NISN: stu.nis,
           Nama_Siswa: stu.name,
           Kelas: stu.className,
           Semester: semester,
@@ -228,7 +228,7 @@ export function downloadImportTemplate(
       availableMaterials,
       materialFilter,
     }).map((row) => ({
-      NIS: row.NIS,
+      NISN: row.NISN,
       Nama_Siswa: row.Nama_Siswa,
       Kelas: row.Kelas,
       Semester: row.Semester,
@@ -241,7 +241,7 @@ export function downloadImportTemplate(
 
     const worksheet = XLSX.utils.json_to_sheet(templateRows);
     worksheet['!cols'] = [
-      { wch: 13 },
+      { wch: 14 },
       { wch: 28 },
       { wch: 10 },
       { wch: 20 },
@@ -267,7 +267,7 @@ export function downloadImportTemplate(
 
   const sampleRows = [
     {
-      NIS: '242507001',
+      NISN: '242507001',
       Nama_Siswa: 'Raka Pratama Nugraha',
       Kelas: 'VII A',
       Semester: 'Ganjil 2026/2027',
@@ -278,7 +278,7 @@ export function downloadImportTemplate(
       Catatan_Guru: '',
     },
     {
-      NIS: '242507002',
+      NISN: '242507002',
       Nama_Siswa: 'Nadia Putri Ramadhani',
       Kelas: 'VII A',
       Semester: 'Ganjil 2026/2027',
@@ -392,8 +392,10 @@ function extractRowsDetectingHeader(
     );
     const hasNisOrName = normalizedCells.some(
       (c) =>
+        c === 'nisn' ||
         c === 'nis' ||
         c === 'noinduk' ||
+        c === 'nomorinduksiswanasional' ||
         c === 'nomorinduksiswa' ||
         c === 'namasiswa'
     );
@@ -447,11 +449,12 @@ export async function parseSpreadsheetFile(
     ]);
     const nis = cleanNisCell(
       pickLookupValue(lookup, [
+        'nisn',
+        'nomorinduksiswanasional',
         'nis',
         'noinduk',
         'nomorinduk',
         'nomorinduksiswa',
-        'nisn',
       ])
     );
     const name = String(
@@ -501,7 +504,7 @@ export async function parseSpreadsheetFile(
 }
 
 export interface StudentExportRow {
-  NIS: string;
+  NISN: string;
   Nama_Siswa: string;
   Kelas: string;
   Jenis_Kelamin: string;
@@ -524,7 +527,7 @@ export function exportStudentsToFile(
       : students.filter((s) => s.className === classFilter);
 
   const rows: StudentExportRow[] = filtered.map((s) => ({
-    NIS: s.nis,
+    NISN: s.nis,
     Nama_Siswa: s.name,
     Kelas: s.className,
     Jenis_Kelamin: s.gender,
@@ -553,7 +556,7 @@ export function exportStudentsToFile(
 export function downloadStudentImportTemplate() {
   const sampleRows: StudentExportRow[] = [
     {
-      NIS: '262707001',
+      NISN: '262707001',
       Nama_Siswa: 'Bima Sakti Nugroho',
       Kelas: 'VII A',
       Jenis_Kelamin: 'L',
@@ -565,7 +568,7 @@ export function downloadStudentImportTemplate() {
       Aktivitas_Non_Akademik: 'OSIS Sekbid Olahraga',
     },
     {
-      NIS: '262707002',
+      NISN: '262707002',
       Nama_Siswa: 'Citra Kirana Dewi',
       Kelas: 'VII B',
       Jenis_Kelamin: 'P',
@@ -592,9 +595,17 @@ export async function parseStudentSpreadsheetFile(file: File) {
 
   return rawRows
     .map((row) => {
-      const nis = String(
-        row.NIS ?? row.nis ?? row['Nomor Induk Siswa'] ?? ''
-      ).trim();
+      const lookup = buildNormalizedRowLookup(row);
+      const nis = cleanNisCell(
+        pickLookupValue(lookup, [
+          'nisn',
+          'nomorinduksiswanasional',
+          'nis',
+          'noinduk',
+          'nomorinduk',
+          'nomorinduksiswa',
+        ])
+      );
       const name = String(
         row.Nama_Siswa ?? row.Nama ?? row.name ?? ''
       ).trim();
@@ -676,7 +687,7 @@ export function exportStudentRecapToFile({
   const sheetRows = rows.map((row, idx) => {
     const record: Record<string, string | number> = {
       No: idx + 1,
-      NIS: row.nis,
+      NISN: row.nis,
       Nama_Siswa: row.name,
       Kelas: row.className,
       Semester: semesterFilter,

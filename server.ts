@@ -457,14 +457,14 @@ async function startServer() {
   app.post('/api/auth/student', (req, res) => {
     const { nis } = req.body as { nis?: string };
     if (!nis || !nis.trim()) {
-      res.status(400).json({ error: 'Nomor Induk Siswa (NIS) wajib diisi.' });
+      res.status(400).json({ error: 'Nomor Induk Siswa Nasional (NISN) wajib diisi.' });
       return;
     }
     const db = getDb();
     const student = db.students.find((s) => s.nis.trim() === nis.trim());
     if (!student) {
       res.status(401).json({
-        error: 'Nomor Induk Siswa (NIS) tidak ditemukan. Periksa kembali NIS Anda.',
+        error: 'Nomor Induk Siswa Nasional (NISN) tidak ditemukan. Periksa kembali NISN Anda.',
       });
       return;
     }
@@ -805,7 +805,7 @@ async function startServer() {
       ? `[SMPN 2 Ciamis - Info Tugas & Nilai PJOK] Yth. ${student.parentName}, materi "${matInfo.name}" (${semester}) ananda ${student.name} (${student.className}) masih terdapat nilai kosong (Praktik: ${pText}, Pengetahuan: ${kText}). Silakan minta nilai dengan praktik atau tugas kepada ${db.settings.teacherName}.${extraInfo ? ` Keterangan: ${extraInfo}` : ''}`
       : isBelowKkm
         ? `[SMPN 2 Ciamis - Perbaikan Nilai PJOK] Yth. ${student.parentName}, nilai materi "${matInfo.name}" (${semester}) ananda ${student.name} (${student.className}) berada di bawah KKM ${activeKkm}: Praktik ${pText}, Pengetahuan ${kText} (Rata-rata ${avgMateri}). Mohon dukungan untuk perbaikan praktik/tugas.${extraInfo ? ` Catatan Guru: ${extraInfo}` : ''}`
-        : `[SMPN 2 Ciamis - Progres Nilai PJOK] Yth. ${student.parentName}, nilai materi "${matInfo.name}" (${semester}) ananda ${student.name} (${student.className}) telah diperbarui oleh ${db.settings.teacherName}: Nilai Praktik ${pText}, Nilai Pengetahuan ${kText} (Rata-rata ${avgMateri}). Pantau detail lewat Portal PJOK dengan NIS ${student.nis}.`;
+        : `[SMPN 2 Ciamis - Progres Nilai PJOK] Yth. ${student.parentName}, nilai materi "${matInfo.name}" (${semester}) ananda ${student.name} (${student.className}) telah diperbarui oleh ${db.settings.teacherName}: Nilai Praktik ${pText}, Nilai Pengetahuan ${kText} (Rata-rata ${avgMateri}). Pantau detail lewat Portal PJOK dengan NISN ${student.nis}.`;
 
     let waGatewaySent = false;
     if (notifyParentWhatsapp !== false) {
@@ -1066,7 +1066,7 @@ async function startServer() {
     if (validRows.length === 0) {
       res.status(400).json({
         error:
-          'Tidak ada baris data nilai yang valid (wajib memiliki kolom NIS atau Nama Siswa).',
+          'Tidak ada baris data nilai yang valid (wajib memiliki kolom NISN atau Nama Siswa).',
       });
       return;
     }
@@ -1397,7 +1397,7 @@ async function startServer() {
     };
 
     if (!body.nis || !body.name || !body.className) {
-      res.status(400).json({ error: 'NIS, Nama, dan Kelas wajib diisi.' });
+      res.status(400).json({ error: 'NISN, Nama, dan Kelas wajib diisi.' });
       return;
     }
 
@@ -1487,7 +1487,7 @@ async function startServer() {
     if (validRows.length === 0) {
       res.status(400).json({
         error:
-          'Tidak ada data siswa yang valid pada file (wajib memiliki kolom NIS dan Nama_Siswa).',
+          'Tidak ada data siswa yang valid pada file (wajib memiliki kolom NISN dan Nama_Siswa).',
       });
       return;
     }
@@ -1680,7 +1680,7 @@ async function startServer() {
       if (!code) {
         res
           .status(400)
-          .json({ error: 'Kode QR, NIS, atau UID RFID/NFC wajib diisi.' });
+          .json({ error: 'Kode QR, NISN, atau UID RFID/NFC wajib diisi.' });
         return;
       }
 
@@ -1733,7 +1733,7 @@ async function startServer() {
 
       const waMessage =
         resolvedStatus === 'Alpa'
-          ? `[NOTIFIKASI ABSENSI SMPN 2 CIAMIS] Yth. ${student.parentName}, kami informasikan ananda ${student.name} (NIS ${student.nis}, Kelas ${student.className}) tercatat ALPA (tanpa keterangan) pada jam pelajaran PJOK tanggal ${targetDate}. Mohon konfirmasi kepada Bapak ${db.settings.teacherName}.`
+          ? `[NOTIFIKASI ABSENSI SMPN 2 CIAMIS] Yth. ${student.parentName}, kami informasikan ananda ${student.name} (NISN ${student.nis}, Kelas ${student.className}) tercatat ALPA (tanpa keterangan) pada jam pelajaran PJOK tanggal ${targetDate}. Mohon konfirmasi kepada Bapak ${db.settings.teacherName}.`
           : isAbsent
             ? `[INFO PRESENSI SMPN 2 CIAMIS] Yth. ${student.parentName}, ananda ${student.name} (${student.className}) tercatat ${resolvedStatus.toUpperCase()} pada pelajaran PJOK tanggal ${targetDate}.`
             : `[PRESENSI REAL-TIME SMPN 2 CIAMIS] Yth. ${student.parentName}, ananda ${student.name} (${student.className}) telah melakukan presensi PJOK (${resolvedStatus}) pukul ${timeStr} melalui ${methodLabel}.`;

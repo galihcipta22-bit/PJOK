@@ -84,10 +84,10 @@ export function Navbar({
             </button>
             <button
               type="button"
-              onClick={() => onNavigateSection('akses-nis')}
+              onClick={() => onNavigateSection('akses-nisn')}
               className="whitespace-nowrap shrink-0 transition-colors hover:text-slate-900 hover:underline underline-offset-4"
             >
-              Portal NIS
+              Portal NISN
             </button>
           </nav>
         ) : (
@@ -113,7 +113,7 @@ export function Navbar({
               className="inline-flex items-center gap-2 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-emerald-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 whitespace-nowrap shrink-0 sm:text-sm"
             >
               <LogIn className="h-4 w-4" />
-              <span>Masuk NIS / Guru</span>
+              <span>Masuk NISN / Guru</span>
             </button>
           ) : (
             <button

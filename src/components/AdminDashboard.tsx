@@ -1331,7 +1331,7 @@ export function AdminDashboard({
       if (validRows.length === 0) {
         setFeedbackBanner({
           type: 'error',
-          text: 'Tidak ditemukan baris siswa yang valid (wajib memiliki kolom NIS atau Nama Siswa).',
+          text: 'Tidak ditemukan baris siswa yang valid (wajib memiliki kolom NISN atau Nama Siswa).',
         });
         return;
       }
@@ -1894,7 +1894,7 @@ export function AdminDashboard({
     if (!editingStudent.nis.trim()) {
       setFeedbackBanner({
         type: 'error',
-        text: 'Isi NIS siswa terlebih dahulu untuk membuat QR Code otomatis.',
+        text: 'Isi NISN siswa terlebih dahulu untuk membuat QR Code otomatis.',
       });
       return;
     }
@@ -2043,7 +2043,7 @@ export function AdminDashboard({
       if (validRows.length === 0) {
         setFeedbackBanner({
           type: 'error',
-          text: 'Tidak ditemukan baris siswa yang valid (wajib memiliki kolom NIS dan Nama_Siswa).',
+          text: 'Tidak ditemukan baris siswa yang valid (wajib memiliki kolom NISN dan Nama_Siswa).',
         });
         return;
       }
@@ -3149,7 +3149,7 @@ export function AdminDashboard({
                                 <div className="text-[10px] font-normal text-slate-400 truncate max-w-[170px]">
                                   {topMaterialFilter === 'ALL'
                                     ? `Unggul: ${item.bestMaterialName}`
-                                    : `NIS ${item.student.nis}`}
+                                    : `NISN ${item.student.nis}`}
                                 </div>
                               </td>
                               <td className="py-2 px-2 text-slate-700">
@@ -3344,7 +3344,7 @@ export function AdminDashboard({
                   type="text"
                   value={recapSearch}
                   onChange={(e) => setRecapSearch(e.target.value)}
-                  placeholder="Cari nama siswa atau NIS..."
+                  placeholder="Cari nama siswa atau NISN..."
                   aria-label="Cari siswa pada rekap nilai"
                   className="w-full rounded-lg border border-slate-300 bg-white py-2 pr-3 pl-9 text-xs text-slate-900 placeholder:text-slate-400 focus:border-emerald-600 focus:outline-none"
                 />
@@ -3441,7 +3441,7 @@ export function AdminDashboard({
                         No
                       </th>
                       <th className="sticky left-11 z-10 bg-slate-50 px-3 py-3 min-w-[190px] border-r border-slate-200">
-                        Nama Siswa &amp; NIS
+                        Nama Siswa &amp; NISN
                       </th>
                       <th className="px-3 py-3 whitespace-nowrap">Kelas</th>
                       <th className="px-3 py-3 text-right whitespace-nowrap">
@@ -3499,7 +3499,7 @@ export function AdminDashboard({
                               {row.name}
                             </p>
                             <p className="font-mono text-[10px] text-slate-400">
-                              NIS {row.nis}
+                              NISN {row.nis}
                             </p>
                           </td>
                           <td className="px-3 py-2.5 font-semibold text-slate-700 whitespace-nowrap">
@@ -3653,7 +3653,7 @@ export function AdminDashboard({
                     type="text"
                     value={gradeStudentSearch}
                     onChange={(e) => setGradeStudentSearch(e.target.value)}
-                    placeholder="Ketik cepat nama / NIS siswa..."
+                    placeholder="Ketik cepat nama / NISN siswa..."
                     className="w-full rounded-lg border border-slate-300 bg-slate-50/70 py-1.5 pl-8 pr-2.5 text-xs text-slate-900 focus:bg-white focus:border-emerald-500 focus:outline-none"
                   />
                 </div>
@@ -4058,7 +4058,7 @@ export function AdminDashboard({
                   type="text"
                   value={gradeListSearch}
                   onChange={(e) => setGradeListSearch(e.target.value)}
-                  placeholder="Cari nama siswa, NIS, atau kelas..."
+                  placeholder="Cari nama siswa, NISN, atau kelas..."
                   className="w-full rounded-lg border border-slate-300 bg-slate-50/60 py-2 pl-9 pr-3 text-xs text-slate-900 focus:border-emerald-500 focus:bg-white focus:outline-none"
                 />
               </div>
@@ -4885,7 +4885,7 @@ export function AdminDashboard({
                 </button>
               </div>
               <p className="mt-1 text-xs text-slate-500">
-                Tempelkan kartu RFID/NFC pada USB Reader (otomatis terbaca) atau ketik UID/NIS lalu tekan Enter.
+                Tempelkan kartu RFID/NFC pada USB Reader (otomatis terbaca) atau ketik UID/NISN lalu tekan Enter.
               </p>
 
               <div className="mt-3 flex items-center justify-between rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs">
@@ -5309,7 +5309,7 @@ export function AdminDashboard({
                         qrCodeValue: e.target.value,
                       }))
                     }
-                    placeholder="Otomatis dari upload QR atau SMPN2PJOK:NIS"
+                    placeholder="Otomatis dari upload QR atau SMPN2PJOK:NISN"
                     className="mt-1 w-full rounded-lg border border-slate-300 bg-white px-3 py-1.5 font-mono text-xs text-slate-900"
                   />
                 </div>
@@ -5318,7 +5318,7 @@ export function AdminDashboard({
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700">
-                    NIS
+                    NISN (Nomor Induk Siswa Nasional)
                   </label>
                   <input
                     type="text"
@@ -5639,7 +5639,7 @@ export function AdminDashboard({
                         {stu.name}
                       </p>
                       <p className="font-mono text-[11px] text-slate-500 truncate">
-                        NIS {stu.nis} · {stu.className} · RFID {stu.rfidUid}
+                        NISN {stu.nis} · {stu.className} · RFID {stu.rfidUid}
                         {stu.qrImageUrl ? ' · QR Custom' : ''}
                       </p>
                     </div>
@@ -6192,7 +6192,7 @@ export function AdminDashboard({
                     {detailStudent.name}
                   </h3>
                   <p className="font-mono text-xs text-slate-500 tabular-nums">
-                    NIS {detailStudent.nis} · {detailStudent.className} · OVR{' '}
+                    NISN {detailStudent.nis} · {detailStudent.className} · OVR{' '}
                     {detailFutData.futStats.ovr} · {detailFutData.talent.primaryTrack}
                   </p>
                 </div>
@@ -6747,7 +6747,7 @@ export function AdminDashboard({
                   <strong>Peringatan Replace Semua:</strong>{' '}
                   {pendingImport.target === 'grades'
                     ? `Seluruh ${grades.length} data nilai yang ada saat ini akan dihapus dan diganti oleh ${pendingImport.rows.length} baris dari file.`
-                    : `Siswa yang tidak tercantum di file ini akan dihapus beserta nilai & riwayat absensinya. Foto/QR siswa dengan NIS yang sama tetap dipertahankan.`}
+                    : `Siswa yang tidak tercantum di file ini akan dihapus beserta nilai & riwayat absensinya. Foto/QR siswa dengan NISN yang sama tetap dipertahankan.`}
                 </div>
               )}
 
@@ -6795,7 +6795,7 @@ export function AdminDashboard({
                     <thead className="bg-slate-50 text-[11px] font-semibold text-slate-500">
                       {pendingImport.target === 'grades' ? (
                         <tr>
-                          <th className="px-3 py-2">NIS / Nama</th>
+                          <th className="px-3 py-2">NISN / Nama</th>
                           <th className="px-3 py-2">Semester</th>
                           <th className="px-3 py-2">Materi</th>
                           <th className="px-3 py-2 text-right">Praktik</th>
@@ -6803,7 +6803,7 @@ export function AdminDashboard({
                         </tr>
                       ) : (
                         <tr>
-                          <th className="px-3 py-2">NIS</th>
+                          <th className="px-3 py-2">NISN</th>
                           <th className="px-3 py-2">Nama Siswa</th>
                           <th className="px-3 py-2">Kelas</th>
                           <th className="px-3 py-2">JK</th>
