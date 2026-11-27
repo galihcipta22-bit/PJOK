@@ -12,10 +12,14 @@ import { Navbar } from './components/Navbar.tsx';
 import { PublicDashboard } from './components/PublicDashboard.tsx';
 import { StudentPortal } from './components/StudentPortal.tsx';
 import { WelcomeSplash } from './components/WelcomeSplash.tsx';
+import { tryJsonApiFetch } from './lib/cloudAdminOperations.ts';
 import {
+  AUTHORIZED_ADMIN_EMAIL,
+  CLOUD_ADMIN_TOKEN,
   formatCloudSyncWarning,
   getPublicOverviewFromCloud,
   getStudentReportFromCloudByNis,
+  isCloudAdminToken,
   isFirebaseAdminReady,
   loadAdminDashboardFromCloud,
   signInAdminWithGoogle,
@@ -179,9 +183,11 @@ export default function App() {
           className: cls,
           semester: sem,
         });
-        const res = await fetch(`/api/public/overview?${params.toString()}`);
-        if (res.ok) {
-          const json = (await res.json()) as PublicOverviewResponse;
+        const apiRes = await tryJsonApiFetch<PublicOverviewResponse>(
+          `/api/public/overview?${params.toString()}`
+        );
+        if (apiRes.reachable && apiRes.ok) {
+          const json = apiRes.data;
           setPublicData(json);
           if (json.selectedClass && json.selectedClass !== cls) {
             setSelectedClass(json.selectedClass);
@@ -263,111 +269,169 @@ export default function App() {
       setAdminLoadError(null);
       setAdminCloudWarning(null);
       try {
-        const res = await fetch('/api/admin/dashboard', {
-          headers: { Authorization: `Bearer ${authToken}` },
-        });
-        if (!res.ok) {
-          if (res.status === 401) {
-            sessionStorage.removeItem('pjok_role');
-            sessionStorage.removeItem('pjok_token');
-            setRole('public');
-            setToken('');
-            setLoginTab('admin');
-            setLoginOpen(true);
+        const cloudOnlyToken = isCloudAdminToken(authToken);
+        const apiRes = await tryJsonApiFetch<AdminDashboardPayload>(
+          '/api/admin/dashboard',
+          { headers: { Authorization: `Bearer ${authToken}` } },
+          cloudOnlyToken
+        );
+
+        if (apiRes.reachable) {
+          if (!apiRes.ok) {
+            if (apiRes.status === 401) {
+              sessionStorage.removeItem('pjok_role');
+              sessionStorage.removeItem('pjok_token');
+              setRole('public');
+              setToken('');
+              setLoginTab('admin');
+              setLoginOpen(true);
+              return;
+            }
+            setAdminLoadError(
+              'Gagal memuat data dashboard dari server. Silakan coba muat ulang.'
+            );
             return;
           }
+
+          const serverPayload = apiRes.data;
+          // Immediately show local server data so admin never sees a blank dashboard
+          setAdminData(serverPayload);
+
+          const effectiveSyncScope =
+            !syncScope && hasPendingCloudSync() ? 'sync' : syncScope;
+
+          if (isFirebaseAdminReady()) {
+            try {
+              if (effectiveSyncScope === 'sync') {
+                const synced = await syncAdminCloudBidirectional(serverPayload);
+                clearPendingCloudSync();
+                if (synced && synced.students.length > 0) {
+                  const syncedWithDefault: AdminDashboardPayload = {
+                    ...synced,
+                    defaultSnapshotInfo:
+                      synced.defaultSnapshotInfo ??
+                      serverPayload.defaultSnapshotInfo,
+                  };
+                  await hydrateServerFromCloud(
+                    authToken,
+                    syncedWithDefault,
+                    true
+                  );
+                  setAdminData(syncedWithDefault);
+                  void fetchPublicOverview(selectedClass, selectedSemester);
+                }
+              } else if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
+                let synced: AdminDashboardPayload;
+                if (effectiveSyncScope === 'config') {
+                  synced = await syncConfigAndOverviewToCloud(serverPayload);
+                } else if (effectiveSyncScope === 'attendance') {
+                  synced = await syncAttendanceDeltaToCloud(serverPayload);
+                } else if (effectiveSyncScope === 'students') {
+                  synced = await syncStudentsDeltaToCloud(serverPayload);
+                } else {
+                  synced = await syncFullDatabaseToCloud(serverPayload);
+                }
+                clearPendingCloudSync();
+                if (synced && synced.students.length > 0) {
+                  const syncedWithDefault: AdminDashboardPayload = {
+                    ...synced,
+                    defaultSnapshotInfo:
+                      synced.defaultSnapshotInfo ??
+                      serverPayload.defaultSnapshotInfo,
+                  };
+                  await hydrateServerFromCloud(
+                    authToken,
+                    syncedWithDefault,
+                    effectiveSyncScope === 'full'
+                  );
+                  setAdminData(syncedWithDefault);
+                  void fetchPublicOverview(selectedClass, selectedSemester);
+                }
+              } else {
+                const cloudPayload =
+                  await loadAdminDashboardFromCloud(serverPayload);
+                if (cloudPayload && cloudPayload.students.length > 0) {
+                  const safePayload: AdminDashboardPayload = {
+                    ...(cloudPayload.grades.length === 0 &&
+                    serverPayload.grades.length > 0
+                      ? { ...cloudPayload, grades: serverPayload.grades }
+                      : cloudPayload),
+                    defaultSnapshotInfo:
+                      cloudPayload.defaultSnapshotInfo ??
+                      serverPayload.defaultSnapshotInfo,
+                  };
+                  await hydrateServerFromCloud(authToken, safePayload, false);
+                  clearPendingCloudSync();
+                  setAdminData(safePayload);
+                  void fetchPublicOverview(selectedClass, selectedSemester);
+                }
+              }
+            } catch (cloudErr) {
+              if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
+                markPendingCloudSync();
+              }
+              const rawMsg =
+                cloudErr instanceof Error ? cloudErr.message : String(cloudErr);
+              console.warn('Cloud Firestore admin sync fallback:', rawMsg);
+              setAdminCloudWarning(formatCloudSyncWarning(rawMsg, 'load'));
+            }
+          } else if (hasPendingCloudSync()) {
+            setAdminCloudWarning(
+              'Perubahan data nilai tersimpan di server lokal namun belum tersinkron ke Cloud Firestore karena akun Google Admin belum terhubung. Klik "Hubungkan Cloud Google" agar nilai muncul di semua perangkat.'
+            );
+          }
+          return;
+        }
+
+        // Cross-device Cloud-only mode when /api/admin/dashboard is unreachable or token is cloud-admin
+        if (!isFirebaseAdminReady()) {
           setAdminLoadError(
-            'Gagal memuat data dashboard dari server. Silakan coba muat ulang.'
+            `Sesi Google Admin (${AUTHORIZED_ADMIN_EMAIL}) belum terhubung di perangkat ini. Klik "Hubungkan Google Admin" di bawah untuk memuat Dashboard Guru dari Cloud Firestore.`
           );
           return;
         }
-        const serverPayload = (await res.json()) as AdminDashboardPayload;
-        // Immediately show local server data so admin never sees a blank dashboard
-        setAdminData(serverPayload);
 
-        const effectiveSyncScope =
-          !syncScope && hasPendingCloudSync() ? 'sync' : syncScope;
-
-        if (isFirebaseAdminReady()) {
-          try {
-            if (effectiveSyncScope === 'sync') {
-              const synced = await syncAdminCloudBidirectional(serverPayload);
-              clearPendingCloudSync();
-              if (synced && synced.students.length > 0) {
-                const syncedWithDefault: AdminDashboardPayload = {
-                  ...synced,
-                  defaultSnapshotInfo:
-                    synced.defaultSnapshotInfo ??
-                    serverPayload.defaultSnapshotInfo,
-                };
-                await hydrateServerFromCloud(authToken, syncedWithDefault, true);
-                setAdminData(syncedWithDefault);
-                void fetchPublicOverview(selectedClass, selectedSemester);
-              }
-            } else if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
-              let synced: AdminDashboardPayload;
-              if (effectiveSyncScope === 'config') {
-                synced = await syncConfigAndOverviewToCloud(serverPayload);
-              } else if (effectiveSyncScope === 'attendance') {
-                synced = await syncAttendanceDeltaToCloud(serverPayload);
-              } else if (effectiveSyncScope === 'students') {
-                synced = await syncStudentsDeltaToCloud(serverPayload);
-              } else {
-                synced = await syncFullDatabaseToCloud(serverPayload);
-              }
-              clearPendingCloudSync();
-              if (synced && synced.students.length > 0) {
-                const syncedWithDefault: AdminDashboardPayload = {
-                  ...synced,
-                  defaultSnapshotInfo:
-                    synced.defaultSnapshotInfo ??
-                    serverPayload.defaultSnapshotInfo,
-                };
-                await hydrateServerFromCloud(
-                  authToken,
-                  syncedWithDefault,
-                  effectiveSyncScope === 'full'
-                );
-                setAdminData(syncedWithDefault);
-                void fetchPublicOverview(selectedClass, selectedSemester);
-              }
+        const existingPayload = adminDataRef.current;
+        try {
+          let loadedCloud: AdminDashboardPayload | null = null;
+          if (syncScope === 'sync') {
+            loadedCloud = await syncAdminCloudBidirectional(existingPayload);
+          } else if (
+            existingPayload &&
+            syncScope &&
+            syncScope !== 'pull'
+          ) {
+            if (syncScope === 'config') {
+              loadedCloud = await syncConfigAndOverviewToCloud(existingPayload);
+            } else if (syncScope === 'attendance') {
+              loadedCloud = await syncAttendanceDeltaToCloud(existingPayload);
+            } else if (syncScope === 'students') {
+              loadedCloud = await syncStudentsDeltaToCloud(existingPayload);
             } else {
-              const cloudPayload =
-                await loadAdminDashboardFromCloud(serverPayload);
-              if (cloudPayload && cloudPayload.students.length > 0) {
-                const safePayload: AdminDashboardPayload = {
-                  ...(cloudPayload.grades.length === 0 &&
-                  serverPayload.grades.length > 0
-                    ? { ...cloudPayload, grades: serverPayload.grades }
-                    : cloudPayload),
-                  defaultSnapshotInfo:
-                    cloudPayload.defaultSnapshotInfo ??
-                    serverPayload.defaultSnapshotInfo,
-                };
-                await hydrateServerFromCloud(authToken, safePayload, false);
-                clearPendingCloudSync();
-                setAdminData(safePayload);
-                void fetchPublicOverview(selectedClass, selectedSemester);
-              }
+              loadedCloud = await syncFullDatabaseToCloud(existingPayload);
             }
-          } catch (cloudErr) {
-            if (effectiveSyncScope && effectiveSyncScope !== 'pull') {
-              markPendingCloudSync();
-            }
-            const rawMsg =
-              cloudErr instanceof Error ? cloudErr.message : String(cloudErr);
-            console.warn('Cloud Firestore admin sync fallback:', rawMsg);
-            setAdminCloudWarning(formatCloudSyncWarning(rawMsg, 'load'));
+          } else {
+            loadedCloud = await loadAdminDashboardFromCloud(existingPayload);
           }
-        } else if (hasPendingCloudSync()) {
-          setAdminCloudWarning(
-            'Perubahan data nilai tersimpan di server lokal namun belum tersinkron ke Cloud Firestore karena akun Google Admin belum terhubung. Klik "Hubungkan Cloud Google" agar nilai muncul di semua perangkat.'
-          );
+
+          if (loadedCloud) {
+            clearPendingCloudSync();
+            setAdminData(loadedCloud);
+            void fetchPublicOverview(selectedClass, selectedSemester);
+          } else {
+            setAdminLoadError(
+              'Database Cloud Firestore belum memiliki data portal. Pastikan sudah melakukan sinkronisasi dari portal utama atau klik Muat Ulang.'
+            );
+          }
+        } catch (cloudErr) {
+          const rawMsg =
+            cloudErr instanceof Error ? cloudErr.message : String(cloudErr);
+          setAdminLoadError(formatCloudSyncWarning(rawMsg, 'load'));
         }
       } catch (err) {
         console.warn('Admin dashboard fetch failed:', err);
         setAdminLoadError(
-          'Tidak dapat terhubung ke server dashboard. Periksa koneksi lalu coba muat ulang.'
+          'Tidak dapat memuat data dashboard. Periksa koneksi internet lalu coba muat ulang.'
         );
       } finally {
         setAuthLoading(false);
@@ -567,6 +631,47 @@ export default function App() {
     [fetchPublicOverview, selectedClass, selectedSemester]
   );
 
+  const handleCommitCloudPayload = useCallback(
+    async (
+      nextPayload: AdminDashboardPayload,
+      scope: 'config' | 'attendance' | 'students' | 'full' = 'full'
+    ): Promise<{ cloudSynced: boolean; warning?: string }> => {
+      adminDataRef.current = nextPayload;
+      setAdminData(nextPayload);
+
+      if (isFirebaseAdminReady()) {
+        try {
+          if (scope === 'config') {
+            await syncConfigAndOverviewToCloud(nextPayload);
+          } else if (scope === 'attendance') {
+            await syncAttendanceDeltaToCloud(nextPayload);
+          } else if (scope === 'students') {
+            await syncStudentsDeltaToCloud(nextPayload);
+          } else {
+            await syncFullDatabaseToCloud(nextPayload);
+          }
+          clearPendingCloudSync();
+          setAdminCloudWarning(null);
+          void fetchPublicOverview(selectedClass, selectedSemester);
+          return { cloudSynced: true };
+        } catch (err) {
+          markPendingCloudSync();
+          const rawMsg = err instanceof Error ? err.message : String(err);
+          const warning = formatCloudSyncWarning(rawMsg, 'load');
+          setAdminCloudWarning(warning);
+          return { cloudSynced: false, warning };
+        }
+      }
+
+      markPendingCloudSync();
+      const offlineWarn =
+        'Perubahan tersimpan sementara, namun belum tersinkron ke Cloud Firestore karena akun Google Admin belum terhubung.';
+      setAdminCloudWarning(offlineWarn);
+      return { cloudSynced: false, warning: offlineWarn };
+    },
+    [fetchPublicOverview, selectedClass, selectedSemester]
+  );
+
   function handleAdminLoginSuccess(newToken: string) {
     sessionStorage.setItem('pjok_role', 'admin');
     sessionStorage.setItem('pjok_token', newToken);
@@ -590,10 +695,12 @@ export default function App() {
   async function handleConnectCloud(): Promise<void> {
     await signInAdminWithGoogle('Galih Cipta Setia, S.Pd.');
     setCloudAdminConnected(isFirebaseAdminReady());
-    if (token) {
-      await fetchAdminDashboard(token, 'sync');
-      await fetchPublicOverview(selectedClass, selectedSemester);
+    const activeToken = token || CLOUD_ADMIN_TOKEN;
+    if (!token) {
+      handleAdminLoginSuccess(activeToken);
     }
+    await fetchAdminDashboard(activeToken, 'sync');
+    await fetchPublicOverview(selectedClass, selectedSemester);
   }
 
   function handleNavigateSection(sectionId: string) {
@@ -689,6 +796,7 @@ export default function App() {
                   onDismissCloudWarning={() => setAdminCloudWarning(null)}
                   onConnectCloud={handleConnectCloud}
                   onApplyGradeMutations={handleApplyGradeMutations}
+                  onCommitCloudPayload={handleCommitCloudPayload}
                   onRefresh={async (scope = 'full') => {
                     await fetchAdminDashboard(token, scope);
                     await fetchPublicOverview(
@@ -711,13 +819,32 @@ export default function App() {
                       {adminLoadError ||
                         'Terjadi kendala saat mengambil data dashboard guru.'}
                     </p>
-                    <button
-                      type="button"
-                      onClick={() => void fetchAdminDashboard(token, false)}
-                      className="mt-4 rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
-                    >
-                      Muat Ulang Data Dashboard
-                    </button>
+                    <div className="mt-4 flex flex-wrap items-center justify-center gap-2">
+                      {!cloudAdminConnected && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            void handleConnectCloud().catch((err) => {
+                              setAdminLoadError(
+                                err instanceof Error
+                                  ? err.message
+                                  : 'Gagal menghubungkan akun Google Admin.'
+                              );
+                            });
+                          }}
+                          className="rounded-lg bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800"
+                        >
+                          Hubungkan Google Admin
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => void fetchAdminDashboard(token, false)}
+                        className="rounded-lg bg-emerald-600 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-700"
+                      >
+                        Muat Ulang Data Dashboard
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}

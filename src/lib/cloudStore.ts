@@ -61,6 +61,12 @@ import {
 } from './firebase.ts';
 
 export const AUTHORIZED_ADMIN_EMAIL = 'galihcipta22@gmail.com';
+export const CLOUD_ADMIN_TOKEN = 'cloud-admin:galihpjok26';
+
+export function isCloudAdminToken(token: string | undefined | null): boolean {
+  return typeof token === 'string' && token.startsWith('cloud-admin:');
+}
+
 const DEFAULT_KKM = 78;
 const LEGACY_TEACHER_NIP = '19920514 201903 1 008';
 const CURRENT_TEACHER_NIP = '19890526 202221 1 006';
@@ -348,8 +354,39 @@ export async function signInAdminWithGoogle(
     !user.emailVerified ||
     user.email?.toLowerCase() !== AUTHORIZED_ADMIN_EMAIL
   ) {
-    const cred = await signInWithPopup(auth, googleProvider);
-    user = cred.user;
+    try {
+      const cred = await signInWithPopup(auth, googleProvider);
+      user = cred.user;
+    } catch (popupErr) {
+      const code =
+        typeof (popupErr as { code?: unknown })?.code === 'string'
+          ? (popupErr as { code: string }).code
+          : '';
+      if (code === 'auth/popup-blocked') {
+        throw new Error(
+          'Jendela login Google diblokir oleh browser. Izinkan pop-up untuk situs ini atau klik langsung tombol "Masuk via Google Admin".'
+        );
+      }
+      if (
+        code === 'auth/popup-closed-by-user' ||
+        code === 'auth/cancelled-popup-request'
+      ) {
+        throw new Error('Jendela login Google ditutup sebelum proses masuk selesai.');
+      }
+      if (code === 'auth/unauthorized-domain') {
+        const host =
+          typeof window !== 'undefined' ? window.location.hostname : 'domain ini';
+        throw new Error(
+          `Domain "${host}" belum diizinkan di Firebase Authentication. Tambahkan domain tersebut di Firebase Console → Authentication → Settings → Authorized domains.`
+        );
+      }
+      if (code === 'auth/network-request-failed') {
+        throw new Error(
+          'Koneksi ke Google Authentication gagal. Periksa koneksi internet Anda lalu coba lagi.'
+        );
+      }
+      throw popupErr;
+    }
   }
 
   if (!user || !user.email) {

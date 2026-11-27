@@ -1,6 +1,9 @@
 import { KeyRound, ShieldCheck, UserCheck, X } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
+import { tryJsonApiFetch } from '../lib/cloudAdminOperations.ts';
 import {
+  AUTHORIZED_ADMIN_EMAIL,
+  CLOUD_ADMIN_TOKEN,
   getStudentReportFromCloudByNis,
   isFirebaseAdminReady,
   signInAdminWithGoogle,
@@ -25,6 +28,7 @@ export function LoginModal({
   const [nis, setNis] = useState('');
   const [adminId, setAdminId] = useState('');
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState('');
 
   if (!open) return null;
@@ -35,19 +39,22 @@ export function LoginModal({
     setLoading(true);
     const cleanNis = nis.trim();
     try {
-      const res = await fetch('/api/auth/student', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nis: cleanNis }),
-      });
-      const json = (await res.json()) as { token?: string; error?: string };
-      if (res.ok && json.token) {
-        onStudentSuccess(json.token, cleanNis);
+      const apiRes = await tryJsonApiFetch<{ token?: string; error?: string }>(
+        '/api/auth/student',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ nis: cleanNis }),
+        }
+      );
+
+      if (apiRes.reachable && apiRes.ok && apiRes.data.token) {
+        onStudentSuccess(apiRes.data.token, cleanNis);
         onClose();
         return;
       }
 
-      // Cross-device published fallback: verify student report in Cloud Firestore by hashed NIS
+      // Cross-device fallback: verify student report in Cloud Firestore by hashed NISN
       const cloudReport = await getStudentReportFromCloudByNis(cleanNis);
       if (cloudReport) {
         onStudentSuccess(`cloud-student:${cleanNis}`, cleanNis);
@@ -56,7 +63,7 @@ export function LoginModal({
       }
 
       setError(
-        json.error ||
+        (apiRes.reachable ? apiRes.data.error : '') ||
           'Nomor Induk Siswa Nasional (NISN) tidak ditemukan.'
       );
     } catch {
@@ -76,16 +83,51 @@ export function LoginModal({
     e.preventDefault();
     setError('');
     setLoading(true);
+    const cleanAdminId = adminId.trim();
     try {
-      const res = await fetch('/api/auth/admin', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminId }),
-      });
-      const json = (await res.json()) as { token?: string; error?: string };
-      if (!res.ok || !json.token) {
-        setError(json.error || 'ID Admin Guru PJOK tidak valid.');
-        setLoading(false);
+      const apiRes = await tryJsonApiFetch<{ token?: string; error?: string }>(
+        '/api/auth/admin',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ adminId: cleanAdminId }),
+        }
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok || !apiRes.data.token) {
+          setError(apiRes.data.error || 'ID Admin Guru PJOK tidak valid.');
+          return;
+        }
+
+        if (!isFirebaseAdminReady()) {
+          try {
+            await signInAdminWithGoogle('Galih Cipta Setia, S.Pd.');
+          } catch (cloudErr) {
+            const msg =
+              cloudErr instanceof Error
+                ? cloudErr.message
+                : 'Login Google Cloud gagal.';
+            const isWrongAccount = msg.includes(
+              'bukan admin guru PJOK terdaftar'
+            );
+            if (isWrongAccount) {
+              setError(msg);
+              return;
+            }
+            // Allow entry so teacher can click "Hubungkan Cloud Google" directly in the header
+            console.warn('Google Cloud popup skipped during login:', msg);
+          }
+        }
+
+        onAdminSuccess(apiRes.data.token);
+        onClose();
+        return;
+      }
+
+      // Cross-device Cloud-only fallback when /api/auth/admin is unreachable (other devices/browsers)
+      if (cleanAdminId !== 'galihpjok26') {
+        setError('ID Admin Guru PJOK tidak valid.');
         return;
       }
 
@@ -96,24 +138,72 @@ export function LoginModal({
           const msg =
             cloudErr instanceof Error
               ? cloudErr.message
-              : 'Login Google Cloud gagal.';
-          const isWrongAccount = msg.includes('bukan admin guru PJOK terdaftar');
-          if (isWrongAccount) {
+              : 'Verifikasi akun Google Admin gagal.';
+          if (/popup|jendela/i.test(msg)) {
+            setError(
+              `${msg} Gunakan tombol "Masuk via Google Admin" di bawah agar popup langsung diizinkan oleh browser perangkat ini.`
+            );
+          } else {
             setError(msg);
-            setLoading(false);
-            return;
           }
-          // Allow entry so teacher can click "Hubungkan Cloud Google" directly in the header
-          console.warn('Google Cloud popup skipped during login:', msg);
+          return;
         }
       }
 
-      onAdminSuccess(json.token);
+      onAdminSuccess(CLOUD_ADMIN_TOKEN);
       onClose();
-    } catch {
-      setError('Tidak dapat terhubung ke server otentikasi.');
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : 'Gagal memverifikasi akses Admin Guru PJOK.'
+      );
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleGoogleAdminLogin() {
+    setError('');
+    setGoogleLoading(true);
+    try {
+      // Trigger Google sign-in synchronously from user click so mobile/strict browsers allow popup
+      if (!isFirebaseAdminReady()) {
+        await signInAdminWithGoogle('Galih Cipta Setia, S.Pd.');
+      }
+
+      // Check if local backend is also reachable so hybrid sync can run if available
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 2500);
+      try {
+        const apiRes = await tryJsonApiFetch<{ token?: string }>(
+          '/api/auth/admin',
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ adminId: 'galihpjok26' }),
+            signal: controller.signal,
+          }
+        );
+        if (apiRes.reachable && apiRes.ok && apiRes.data.token) {
+          onAdminSuccess(apiRes.data.token);
+          onClose();
+          return;
+        }
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+
+      onAdminSuccess(CLOUD_ADMIN_TOKEN);
+      onClose();
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : `Gagal masuk dengan akun Google Admin (${AUTHORIZED_ADMIN_EMAIL}).`
+      );
+    } finally {
+      setGoogleLoading(false);
     }
   }
 
@@ -220,35 +310,64 @@ export function LoginModal({
               </button>
             </form>
           ) : (
-            <form onSubmit={handleAdminSubmit} className="space-y-4">
-              <div>
-                <label
-                  htmlFor="admin-id"
-                  className="block text-xs font-semibold text-slate-700"
+            <div className="space-y-4">
+              <form onSubmit={handleAdminSubmit} className="space-y-4">
+                <div>
+                  <label
+                    htmlFor="admin-id"
+                    className="block text-xs font-semibold text-slate-700"
+                  >
+                    ID Admin Guru PJOK
+                  </label>
+                  <input
+                    id="admin-id"
+                    type="text"
+                    required
+                    autoFocus
+                    value={adminId}
+                    onChange={(e) => setAdminId(e.target.value)}
+                    placeholder="Masukkan ID Admin Guru PJOK"
+                    className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm text-slate-900 focus:border-emerald-600 focus:outline-none"
+                  />
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={loading || googleLoading}
+                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-60"
                 >
-                  ID Admin Guru PJOK
-                </label>
-                <input
-                  id="admin-id"
-                  type="text"
-                  required
-                  autoFocus
-                  value={adminId}
-                  onChange={(e) => setAdminId(e.target.value)}
-                  placeholder="Masukkan ID Admin Guru PJOK"
-                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm text-slate-900 focus:border-emerald-600 focus:outline-none"
-                />
+                  <KeyRound className="h-4 w-4" />
+                  <span>
+                    {loading ? 'Memverifikasi ID...' : 'Masuk Dashboard Guru PJOK'}
+                  </span>
+                </button>
+              </form>
+
+              <div className="relative py-1">
+                <div className="absolute inset-0 flex items-center">
+                  <span className="w-full border-t border-slate-200" />
+                </div>
+                <div className="relative flex justify-center text-[11px] uppercase">
+                  <span className="bg-white px-2 text-slate-400">
+                    atau login lintas perangkat
+                  </span>
+                </div>
               </div>
 
               <button
-                type="submit"
-                disabled={loading}
-                className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-60"
+                type="button"
+                onClick={() => void handleGoogleAdminLogin()}
+                disabled={loading || googleLoading}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-600 bg-emerald-50 px-4 py-2.5 text-xs font-semibold text-emerald-800 transition-colors hover:bg-emerald-100 disabled:opacity-60"
               >
-                <KeyRound className="h-4 w-4" />
-                <span>{loading ? 'Memverifikasi ID...' : 'Masuk Dashboard Guru PJOK'}</span>
+                <ShieldCheck className="h-4 w-4 text-emerald-700" />
+                <span>
+                  {googleLoading
+                    ? 'Membuka Login Google Admin...'
+                    : `Masuk via Google Admin (${AUTHORIZED_ADMIN_EMAIL})`}
+                </span>
               </button>
-            </form>
+            </div>
           )}
         </div>
       </div>

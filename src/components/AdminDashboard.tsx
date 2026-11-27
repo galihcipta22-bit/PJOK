@@ -43,6 +43,27 @@ import {
   YAxis,
 } from 'recharts';
 import {
+  applyAttendanceScanCloudLocal,
+  applyBatchGradesCloudLocal,
+  applyDeleteMaterialCloudLocal,
+  applyDeleteSemesterCloudLocal,
+  applyDeleteStudentCloudLocal,
+  applyImportGradesCloudLocal,
+  applyImportStudentsCloudLocal,
+  applyLinkRfidCloudLocal,
+  applyMarkAbsentCloudLocal,
+  applyResetDefaultCurriculumCloudLocal,
+  applySaveClassKkmCloudLocal,
+  applySaveMaterialCloudLocal,
+  applySaveSemesterCloudLocal,
+  applySaveSettingsCloudLocal,
+  applySaveStudentCloudLocal,
+  applySingleGradeCloudLocal,
+  applySyncAllGradesCloudLocal,
+  tryJsonApiFetchWithRetry,
+} from '../lib/cloudAdminOperations.ts';
+import {
+  isCloudAdminToken,
   isFirebaseAdminReady,
   uploadMediaAssetIfDataUrl,
 } from '../lib/cloudStore.ts';
@@ -110,41 +131,14 @@ interface AdminDashboardProps {
   onApplyGradeMutations?: (
     mutation: GradeMutationUpdate
   ) => Promise<{ cloudSynced: boolean; warning?: string }>;
+  onCommitCloudPayload?: (
+    nextPayload: AdminDashboardPayload,
+    scope?: 'config' | 'attendance' | 'students' | 'full'
+  ) => Promise<{ cloudSynced: boolean; warning?: string }>;
   cloudConnected?: boolean;
   cloudWarning?: string | null;
   onDismissCloudWarning?: () => void;
   onConnectCloud?: () => Promise<void>;
-}
-
-async function apiFetchWithRetry(
-  input: string,
-  init?: RequestInit,
-  retries = 2
-): Promise<Response> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      return await fetch(input, init);
-    } catch (err) {
-      lastError = err;
-      if (attempt < retries) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, attempt === 0 ? 350 : 800)
-        );
-      }
-    }
-  }
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('Koneksi ke server terputus. Silakan coba lagi.');
-}
-
-async function safeParseJson<T>(res: Response): Promise<T> {
-  try {
-    return (await res.json()) as T;
-  } catch {
-    return {} as T;
-  }
 }
 
 type AdminTab =
@@ -254,6 +248,7 @@ export function AdminDashboard({
   payload,
   onRefresh,
   onApplyGradeMutations,
+  onCommitCloudPayload,
   cloudConnected = false,
   cloudWarning = null,
   onDismissCloudWarning,
@@ -1083,59 +1078,79 @@ export function AdminDashboard({
     setSavingGrade(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/grades', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          studentId: gradeStudentId,
-          semester: semesterFilter,
-          materialCode: gradeMaterial,
-          praktikScore: gradePraktik.trim() === '' ? null : Number(gradePraktik),
-          pengetahuanScore:
-            gradePengetahuan.trim() === '' ? null : Number(gradePengetahuan),
-          teacherNote: gradeNote,
-          remedialDetail: gradeRemedialDetail,
-          notifyParentWhatsapp: true,
-        }),
-      });
-      const json = await safeParseJson<{
+      const reqPayload = {
+        studentId: gradeStudentId,
+        semester: semesterFilter,
+        materialCode: gradeMaterial,
+        praktikScore: gradePraktik.trim() === '' ? null : Number(gradePraktik),
+        pengetahuanScore:
+          gradePengetahuan.trim() === '' ? null : Number(gradePengetahuan),
+        teacherNote: gradeNote,
+        remedialDetail: gradeRemedialDetail,
+        notifyParentWhatsapp: true,
+      };
+      const apiRes = await tryJsonApiFetchWithRetry<{
         error?: string;
         grade?: GradeRecord;
         savedGrades?: GradeRecord[];
         notification?: NotificationRecord;
-      }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyimpan nilai atau keterangan.',
-        });
-        return;
+      }>(
+        '/api/admin/grades',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(reqPayload),
+        },
+        isCloudAdminToken(token)
+      );
+
+      let updatedGrades: GradeRecord[] = [];
+      let createdNotification: NotificationRecord | undefined;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan nilai atau keterangan.',
+          });
+          return;
+        }
+        updatedGrades =
+          apiRes.data.savedGrades && apiRes.data.savedGrades.length > 0
+            ? apiRes.data.savedGrades
+            : apiRes.data.grade
+              ? [apiRes.data.grade]
+              : [];
+        createdNotification = apiRes.data.notification;
+      } else {
+        const localRes = applySingleGradeCloudLocal(payload, reqPayload);
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        updatedGrades = localRes.savedGrades;
+        createdNotification = localRes.notification;
       }
-      const updatedGrades =
-        json.savedGrades && json.savedGrades.length > 0
-          ? json.savedGrades
-          : json.grade
-            ? [json.grade]
-            : [];
+
       let cloudNote = '';
       if (updatedGrades.length > 0 && onApplyGradeMutations) {
         const syncRes = await onApplyGradeMutations({
           savedGrades: updatedGrades,
-          createdNotifications: json.notification ? [json.notification] : [],
+          createdNotifications: createdNotification ? [createdNotification] : [],
         });
         cloudNote = syncRes.cloudSynced
           ? ' & tersinkron ke Cloud Firestore untuk semua perangkat.'
-          : ' (tersimpan di server lokal; hubungkan Google Cloud di header agar tampil di perangkat lain).';
+          : ' (tersimpan sementara; hubungkan Google Cloud di header agar tampil di perangkat lain).';
       } else {
         await onRefresh();
       }
       setFeedbackBanner({
         type: 'success',
         text: `Nilai & deskripsi otomatis langsung tersimpan${cloudNote}`,
-        waUrl: json.notification?.whatsappUrl,
+        waUrl: createdNotification?.whatsappUrl,
       });
     } catch (err) {
       setFeedbackBanner({
@@ -1143,7 +1158,7 @@ export function AdminDashboard({
         text:
           err instanceof Error && err.message !== 'Failed to fetch'
             ? err.message
-            : 'Gagal terhubung ke server saat menyimpan nilai. Silakan coba lagi.',
+            : 'Gagal menyimpan nilai. Silakan coba lagi.',
       });
     } finally {
       setSavingGrade(false);
@@ -1164,26 +1179,48 @@ export function AdminDashboard({
     setSavingBatchGrades(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/grades/batch', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ items }),
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         error?: string;
         savedGrades?: GradeRecord[];
         createdNotifications?: NotificationRecord[];
         updatedCount?: number;
-      }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyimpan perubahan nilai.',
-        });
-        return;
+      }>(
+        '/api/admin/grades/batch',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ items }),
+        },
+        isCloudAdminToken(token)
+      );
+
+      let savedGrades: GradeRecord[] = [];
+      let createdNotifications: NotificationRecord[] = [];
+      let updatedCount = items.length;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan perubahan nilai.',
+          });
+          return;
+        }
+        savedGrades = apiRes.data.savedGrades ?? [];
+        createdNotifications = apiRes.data.createdNotifications ?? [];
+        updatedCount = apiRes.data.updatedCount ?? items.length;
+      } else {
+        const localRes = applyBatchGradesCloudLocal(payload, items);
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        savedGrades = localRes.savedGrades;
+        createdNotifications = localRes.createdNotifications;
+        updatedCount = localRes.updatedCount;
       }
 
       setInlineEdits((prev) => {
@@ -1193,27 +1230,27 @@ export function AdminDashboard({
       });
 
       let cloudNote = ' & disinkronkan';
-      if (json.savedGrades && onApplyGradeMutations) {
+      if (savedGrades.length > 0 && onApplyGradeMutations) {
         const syncRes = await onApplyGradeMutations({
-          savedGrades: json.savedGrades,
-          createdNotifications: json.createdNotifications ?? [],
+          savedGrades,
+          createdNotifications,
         });
         cloudNote = syncRes.cloudSynced
           ? ' & tersinkron ke Cloud Firestore untuk semua perangkat'
-          : ' di server lokal (hubungkan Cloud Google di header agar muncul di perangkat lain)';
+          : ' (hubungkan Cloud Google di header agar muncul di perangkat lain)';
       } else {
         await onRefresh();
       }
 
       setFeedbackBanner({
         type: 'success',
-        text: `${json.updatedCount ?? items.length} nilai siswa berhasil disimpan${cloudNote}.`,
-        waUrl: json.createdNotifications?.[0]?.whatsappUrl,
+        text: `${updatedCount} nilai siswa berhasil disimpan${cloudNote}.`,
+        waUrl: createdNotifications[0]?.whatsappUrl,
       });
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menyimpan nilai massal.',
+        text: 'Gagal menyimpan nilai massal ke server & Cloud Firestore.',
       });
     } finally {
       setSavingBatchGrades(false);
@@ -1227,74 +1264,93 @@ export function AdminDashboard({
     setInlineEditorError(null);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/grades', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          studentId: detailStudent.id,
-          semester: detailSemester,
-          materialCode: inlineMatEditor.materialCode,
-          praktikScore:
-            inlineMatEditor.praktikScore.trim() === ''
-              ? null
-              : Number(inlineMatEditor.praktikScore),
-          pengetahuanScore:
-            inlineMatEditor.pengetahuanScore.trim() === ''
-              ? null
-              : Number(inlineMatEditor.pengetahuanScore),
-          teacherNote: inlineMatEditor.teacherNote,
-          remedialDetail: inlineMatEditor.remedialDetail,
-          notifyParentWhatsapp: true,
-        }),
-      });
-      const json = await safeParseJson<{
+      const reqPayload = {
+        studentId: detailStudent.id,
+        semester: detailSemester,
+        materialCode: inlineMatEditor.materialCode,
+        praktikScore:
+          inlineMatEditor.praktikScore.trim() === ''
+            ? null
+            : Number(inlineMatEditor.praktikScore),
+        pengetahuanScore:
+          inlineMatEditor.pengetahuanScore.trim() === ''
+            ? null
+            : Number(inlineMatEditor.pengetahuanScore),
+        teacherNote: inlineMatEditor.teacherNote,
+        remedialDetail: inlineMatEditor.remedialDetail,
+        notifyParentWhatsapp: true,
+      };
+      const apiRes = await tryJsonApiFetchWithRetry<{
         error?: string;
         grade?: GradeRecord;
         savedGrades?: GradeRecord[];
         notification?: NotificationRecord;
-      }>(res);
-      if (!res.ok) {
-        const msg = json.error || 'Gagal menyimpan detail materi siswa.';
-        setInlineEditorError(msg);
-        setFeedbackBanner({
-          type: 'error',
-          text: msg,
-        });
-        return;
+      }>(
+        '/api/admin/grades',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(reqPayload),
+        },
+        isCloudAdminToken(token)
+      );
+
+      let updatedGrades: GradeRecord[] = [];
+      let createdNotification: NotificationRecord | undefined;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          const msg = apiRes.data.error || 'Gagal menyimpan detail materi siswa.';
+          setInlineEditorError(msg);
+          setFeedbackBanner({ type: 'error', text: msg });
+          return;
+        }
+        updatedGrades =
+          apiRes.data.savedGrades && apiRes.data.savedGrades.length > 0
+            ? apiRes.data.savedGrades
+            : apiRes.data.grade
+              ? [apiRes.data.grade]
+              : [];
+        createdNotification = apiRes.data.notification;
+      } else {
+        const localRes = applySingleGradeCloudLocal(payload, reqPayload);
+        if (!localRes.ok) {
+          setInlineEditorError(localRes.error);
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        updatedGrades = localRes.savedGrades;
+        createdNotification = localRes.notification;
       }
+
       const savedMaterialName = inlineMatEditor.materialName;
       setInlineMatEditor(null);
-      const updatedGrades =
-        json.savedGrades && json.savedGrades.length > 0
-          ? json.savedGrades
-          : json.grade
-            ? [json.grade]
-            : [];
+
       let cloudSuffix = '.';
       if (updatedGrades.length > 0 && onApplyGradeMutations) {
         const syncRes = await onApplyGradeMutations({
           savedGrades: updatedGrades,
-          createdNotifications: json.notification ? [json.notification] : [],
+          createdNotifications: createdNotification ? [createdNotification] : [],
         });
         cloudSuffix = syncRes.cloudSynced
           ? ' & tersinkron ke Cloud Firestore.'
-          : ' (tersimpan di server lokal; hubungkan Cloud Google di header agar tampil di perangkat lain).';
+          : ' (hubungkan Cloud Google di header agar tampil di perangkat lain).';
       } else {
         await onRefresh();
       }
       setFeedbackBanner({
         type: 'success',
         text: `Detail materi "${savedMaterialName}" untuk ${detailStudent.name} berhasil diperbarui${cloudSuffix}`,
-        waUrl: json.notification?.whatsappUrl,
+        waUrl: createdNotification?.whatsappUrl,
       });
     } catch (err) {
       const msg =
         err instanceof Error && err.message !== 'Failed to fetch'
           ? err.message
-          : 'Gagal terhubung ke server saat menyimpan detail materi. Silakan coba klik simpan kembali.';
+          : 'Gagal menyimpan detail materi. Silakan coba klik simpan kembali.';
       setInlineEditorError(msg);
       setFeedbackBanner({
         type: 'error',
@@ -1307,15 +1363,18 @@ export function AdminDashboard({
 
   async function handleDeleteGrade(id: string) {
     try {
-      const res = await apiFetchWithRetry(`/api/admin/grades/${id}`, {
-        method: 'DELETE',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!res.ok) {
-        const json = await safeParseJson<{ error?: string }>(res);
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        `/api/admin/grades/${id}`,
+        {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${token}` },
+        },
+        isCloudAdminToken(token)
+      );
+      if (apiRes.reachable && !apiRes.ok) {
         setFeedbackBanner({
           type: 'error',
-          text: json.error || 'Gagal menghapus data nilai.',
+          text: apiRes.data.error || 'Gagal menghapus data nilai.',
         });
         return;
       }
@@ -1330,7 +1389,7 @@ export function AdminDashboard({
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menghapus nilai.',
+        text: 'Gagal menghapus data nilai.',
       });
     }
   }
@@ -1393,19 +1452,7 @@ export function AdminDashboard({
           return;
         }
 
-        const res = await apiFetchWithRetry('/api/admin/grades/import', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            rows: rowsToSend,
-            mode: pendingImport.mode,
-            setAsDefault: pendingImport.setAsDefault,
-          }),
-        });
-        const json = await safeParseJson<{
+        const apiRes = await tryJsonApiFetchWithRetry<{
           mode?: ImportMode;
           createdCount?: number;
           editedCount?: number;
@@ -1419,81 +1466,156 @@ export function AdminDashboard({
           savedAsDefault?: boolean;
           defaultSnapshotInfo?: DefaultSnapshotInfo;
           error?: string;
-        }>(res);
-        if (!res.ok) {
-          setFeedbackBanner({
-            type: 'error',
-            text: json.error || 'Gagal mengimpor file nilai.',
-          });
-          return;
+        }>(
+          '/api/admin/grades/import',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              rows: rowsToSend,
+              mode: pendingImport.mode,
+              setAsDefault: pendingImport.setAsDefault,
+            }),
+          },
+          isCloudAdminToken(token)
+        );
+
+        let importResult: {
+          mode?: ImportMode;
+          createdCount?: number;
+          editedCount?: number;
+          updatedCount?: number;
+          removedCount?: number;
+          createdStudents?: number;
+          savedGrades?: GradeRecord[];
+          createdStudentsList?: AdminStudentSummary[];
+          createdNotifications?: NotificationRecord[];
+          availableSemesters?: string[];
+          savedAsDefault?: boolean;
+          defaultSnapshotInfo?: DefaultSnapshotInfo;
+        };
+
+        if (apiRes.reachable) {
+          if (!apiRes.ok) {
+            setFeedbackBanner({
+              type: 'error',
+              text: apiRes.data.error || 'Gagal mengimpor file nilai.',
+            });
+            return;
+          }
+          importResult = apiRes.data;
+        } else {
+          const localRes = applyImportGradesCloudLocal(
+            payload,
+            rowsToSend,
+            pendingImport.mode
+          );
+          if (!localRes.ok) {
+            setFeedbackBanner({ type: 'error', text: localRes.error });
+            return;
+          }
+          importResult = localRes;
         }
+
         setPendingImport(null);
         let cloudSynced = false;
-        if (json.savedGrades && onApplyGradeMutations) {
+        if (importResult.savedGrades && onApplyGradeMutations) {
           const syncRes = await onApplyGradeMutations({
-            savedGrades: json.savedGrades,
-            createdStudents: json.createdStudentsList ?? [],
-            createdNotifications: json.createdNotifications ?? [],
-            availableSemesters: json.availableSemesters,
-            replaceAllGrades: json.mode === 'replace',
-            defaultSnapshotInfo: json.defaultSnapshotInfo,
+            savedGrades: importResult.savedGrades,
+            createdStudents: importResult.createdStudentsList ?? [],
+            createdNotifications: importResult.createdNotifications ?? [],
+            availableSemesters: importResult.availableSemesters,
+            replaceAllGrades: importResult.mode === 'replace',
+            defaultSnapshotInfo: importResult.defaultSnapshotInfo,
           });
           cloudSynced = syncRes.cloudSynced;
         } else {
           await onRefresh();
         }
-        const defaultSuffix = json.savedAsDefault
+        const defaultSuffix = importResult.savedAsDefault
           ? ' Data nilai ini juga otomatis ditetapkan sebagai Default Portal.'
           : '';
         const cloudSuffix = cloudSynced
           ? ' Seluruh nilai telah tersinkron ke Cloud Firestore untuk semua perangkat.'
-          : ' Tersimpan di server lokal; klik "Hubungkan Cloud Google" di header agar nilai tampil di perangkat lain.';
+          : ' Klik "Hubungkan Cloud Google" di header agar nilai tampil di perangkat lain.';
         const summaryMsg =
-          json.mode === 'replace'
-            ? `Replace seluruh nilai berhasil: ${json.removedCount ?? 0} entri nilai lama diganti dengan ${json.updatedCount ?? 0} data nilai baru (${json.createdStudents ?? 0} siswa baru ditambahkan).${defaultSuffix}${cloudSuffix}`
-            : `Import nilai berhasil: ${json.createdCount ?? 0} nilai baru ditambahkan, ${json.editedCount ?? 0} nilai diperbarui (${json.createdStudents ?? 0} siswa baru).${defaultSuffix}${cloudSuffix}`;
+          importResult.mode === 'replace'
+            ? `Replace seluruh nilai berhasil: ${importResult.removedCount ?? 0} entri nilai lama diganti dengan ${importResult.updatedCount ?? 0} data nilai baru (${importResult.createdStudents ?? 0} siswa baru ditambahkan).${defaultSuffix}${cloudSuffix}`
+            : `Import nilai berhasil: ${importResult.createdCount ?? 0} nilai baru ditambahkan, ${importResult.editedCount ?? 0} nilai diperbarui (${importResult.createdStudents ?? 0} siswa baru).${defaultSuffix}${cloudSuffix}`;
         setFeedbackBanner({
           type: 'success',
           text: summaryMsg,
         });
         return;
       } else {
-        const res = await apiFetchWithRetry('/api/admin/students/import', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            rows: pendingImport.rows,
-            mode: pendingImport.mode,
-          }),
-        });
-        const json = await safeParseJson<{
+        const apiRes = await tryJsonApiFetchWithRetry<{
           mode?: ImportMode;
           createdCount?: number;
           updatedCount?: number;
           removedCount?: number;
           error?: string;
-        }>(res);
-        if (!res.ok) {
-          setFeedbackBanner({
-            type: 'error',
-            text: json.error || 'Gagal mengimpor data siswa.',
-          });
+        }>(
+          '/api/admin/students/import',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              rows: pendingImport.rows,
+              mode: pendingImport.mode,
+            }),
+          },
+          isCloudAdminToken(token)
+        );
+
+        if (apiRes.reachable) {
+          if (!apiRes.ok) {
+            setFeedbackBanner({
+              type: 'error',
+              text: apiRes.data.error || 'Gagal mengimpor data siswa.',
+            });
+            return;
+          }
+          const summaryMsg =
+            apiRes.data.mode === 'replace'
+              ? `Replace seluruh data siswa selesai: ${apiRes.data.createdCount ?? 0} siswa baru, ${apiRes.data.updatedCount ?? 0} siswa diperbarui, ${apiRes.data.removedCount ?? 0} siswa lama dihapus.`
+              : `Import siswa (Tambah & Perbarui) selesai: ${apiRes.data.createdCount ?? 0} siswa baru ditambahkan, ${apiRes.data.updatedCount ?? 0} siswa yang diedit diperbarui.`;
+          setFeedbackBanner({ type: 'success', text: summaryMsg });
+          setPendingImport(null);
+          await onRefresh();
           return;
         }
+
+        const localRes = applyImportStudentsCloudLocal(
+          payload,
+          pendingImport.rows,
+          pendingImport.mode
+        );
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        setPendingImport(null);
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(
+            localRes.nextPayload,
+            localRes.mode === 'replace' ? 'full' : 'students'
+          );
+        } else {
+          await onRefresh('students');
+        }
         const summaryMsg =
-          json.mode === 'replace'
-            ? `Replace seluruh data siswa selesai: ${json.createdCount ?? 0} siswa baru, ${json.updatedCount ?? 0} siswa diperbarui, ${json.removedCount ?? 0} siswa lama dihapus.`
-            : `Import siswa (Tambah & Perbarui) selesai: ${json.createdCount ?? 0} siswa baru ditambahkan, ${json.updatedCount ?? 0} siswa yang diedit diperbarui.`;
-        setFeedbackBanner({
-          type: 'success',
-          text: summaryMsg,
-        });
+          localRes.mode === 'replace'
+            ? `Replace seluruh data siswa di Cloud selesai: ${localRes.createdCount} siswa baru, ${localRes.updatedCount} siswa diperbarui, ${localRes.removedCount} siswa lama dihapus.`
+            : `Import siswa ke Cloud selesai: ${localRes.createdCount} siswa baru ditambahkan, ${localRes.updatedCount} siswa diperbarui.`;
+        setFeedbackBanner({ type: 'success', text: summaryMsg });
+        return;
       }
-      setPendingImport(null);
-      await onRefresh();
     } catch {
       setFeedbackBanner({
         type: 'error',
@@ -1507,54 +1629,87 @@ export function AdminDashboard({
   async function submitAttendanceScan(
     code: string,
     method: AttendanceMethod,
-    statusOverride?: AttendanceStatus
+    statusOverride?: AttendanceStatus,
+    payloadOverride?: AdminDashboardPayload
   ) {
     if (!code.trim()) return;
     setFeedbackBanner(null);
     setUnregisteredUid('');
+    const currentPayload = payloadOverride ?? payload;
     try {
-      const res = await apiFetchWithRetry('/api/admin/attendance/scan', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          code: code.trim(),
-          method,
-          status: statusOverride || attendanceStatus,
-          date: attendanceDate,
-          time: getLocalTimeStr(),
-        }),
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         error?: string;
         unregisteredCode?: string;
         student?: { name: string; className: string };
         record?: { status: string };
         whatsappUrl?: string;
-      }>(res);
-      if (!res.ok) {
-        if (json.unregisteredCode) {
-          setUnregisteredUid(json.unregisteredCode);
+      }>(
+        '/api/admin/attendance/scan',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            code: code.trim(),
+            method,
+            status: statusOverride || attendanceStatus,
+            date: attendanceDate,
+            time: getLocalTimeStr(),
+          }),
+        },
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          if (apiRes.data.unregisteredCode) {
+            setUnregisteredUid(apiRes.data.unregisteredCode);
+          }
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal mencatat presensi.',
+          });
+          return;
         }
         setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal mencatat presensi.',
+          type: 'success',
+          text: `Presensi tercatat: ${apiRes.data.student?.name} (${apiRes.data.student?.className}) — Status ${apiRes.data.record?.status}.`,
+          waUrl: apiRes.data.whatsappUrl,
         });
+        setRfidInput('');
+        await onRefresh('attendance');
         return;
+      }
+
+      const localRes = applyAttendanceScanCloudLocal(currentPayload, {
+        code: code.trim(),
+        method,
+        status: statusOverride || attendanceStatus,
+        date: attendanceDate,
+        time: getLocalTimeStr(),
+      });
+      if (!localRes.ok) {
+        if (localRes.unregisteredCode) {
+          setUnregisteredUid(localRes.unregisteredCode);
+        }
+        setFeedbackBanner({ type: 'error', text: localRes.error });
+        return;
+      }
+      if (onCommitCloudPayload) {
+        await onCommitCloudPayload(localRes.nextPayload, 'attendance');
       }
       setFeedbackBanner({
         type: 'success',
-        text: `Presensi tercatat: ${json.student?.name} (${json.student?.className}) — Status ${json.record?.status}.`,
-        waUrl: json.whatsappUrl,
+        text: `Presensi tercatat & disinkronkan: ${localRes.student.name} (${localRes.student.className}) — Status ${localRes.record.status}.`,
+        waUrl: localRes.whatsappUrl,
       });
       setRfidInput('');
-      await onRefresh('attendance');
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat mencatat presensi. Silakan coba lagi.',
+        text: 'Gagal mencatat presensi. Silakan coba lagi.',
       });
     }
   }
@@ -1670,32 +1825,59 @@ export function AdminDashboard({
   async function handleLinkUnregisteredCard() {
     if (!unregisteredUid || !linkStudentId) return;
     try {
-      const res = await apiFetchWithRetry('/api/admin/students/link-rfid', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/students/link-rfid',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            studentId: linkStudentId,
+            rfidUid: unregisteredUid,
+          }),
         },
-        body: JSON.stringify({
-          studentId: linkStudentId,
-          rfidUid: unregisteredUid,
-        }),
-      });
-      if (res.ok) {
-        const uidToScan = unregisteredUid;
-        setUnregisteredUid('');
-        await submitAttendanceScan(uidToScan, 'RFID_TAP');
-      } else {
-        const json = await safeParseJson<{ error?: string }>(res);
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menautkan kartu RFID.',
-        });
+        isCloudAdminToken(token)
+      );
+      if (apiRes.reachable) {
+        if (apiRes.ok) {
+          const uidToScan = unregisteredUid;
+          setUnregisteredUid('');
+          await submitAttendanceScan(uidToScan, 'RFID_TAP');
+        } else {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menautkan kartu RFID.',
+          });
+        }
+        return;
       }
+
+      const localRes = applyLinkRfidCloudLocal(
+        payload,
+        linkStudentId,
+        unregisteredUid
+      );
+      if (!localRes.ok) {
+        setFeedbackBanner({ type: 'error', text: localRes.error });
+        return;
+      }
+      if (onCommitCloudPayload) {
+        await onCommitCloudPayload(localRes.nextPayload, 'students');
+      }
+      const uidToScan = unregisteredUid;
+      setUnregisteredUid('');
+      await submitAttendanceScan(
+        uidToScan,
+        'RFID_TAP',
+        undefined,
+        localRes.nextPayload
+      );
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menautkan kartu RFID.',
+        text: 'Gagal menautkan kartu RFID.',
       });
     }
   }
@@ -1818,40 +2000,61 @@ export function AdminDashboard({
 
   async function handleMarkAbsentClass() {
     try {
-      const res = await apiFetchWithRetry('/api/admin/attendance/mark-absent', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          className: classFilter,
-          date: attendanceDate,
-          time: getLocalTimeStr(),
-        }),
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         count?: number;
         alerts?: Array<{ whatsappUrl: string }>;
         error?: string;
-      }>(res);
-      if (!res.ok) {
+      }>(
+        '/api/admin/attendance/mark-absent',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            className: classFilter,
+            date: attendanceDate,
+            time: getLocalTimeStr(),
+          }),
+        },
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menandai siswa alpa.',
+          });
+          return;
+        }
         setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menandai siswa alpa.',
+          type: 'success',
+          text: `${apiRes.data.count ?? 0} siswa yang belum tap dicatat ALPA dan notifikasi WhatsApp orang tua telah dibuat.`,
+          waUrl: apiRes.data.alerts?.[0]?.whatsappUrl,
         });
+        await onRefresh('attendance');
         return;
+      }
+
+      const localRes = applyMarkAbsentCloudLocal(payload, {
+        className: classFilter,
+        date: attendanceDate,
+        time: getLocalTimeStr(),
+      });
+      if (onCommitCloudPayload) {
+        await onCommitCloudPayload(localRes.nextPayload, 'attendance');
       }
       setFeedbackBanner({
         type: 'success',
-        text: `${json.count ?? 0} siswa yang belum tap dicatat ALPA dan notifikasi WhatsApp orang tua telah dibuat.`,
-        waUrl: json.alerts?.[0]?.whatsappUrl,
+        text: `${localRes.count} siswa yang belum tap dicatat ALPA dan disinkronkan ke Cloud Firestore.`,
+        waUrl: localRes.alerts[0]?.whatsappUrl,
       });
-      await onRefresh('attendance');
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat memproses absensi kelas.',
+        text: 'Gagal memproses absensi kelas.',
       });
     }
   }
@@ -1952,26 +2155,46 @@ export function AdminDashboard({
         };
       }
 
-      const res = await apiFetchWithRetry('/api/admin/students', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/students',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(preparedStudent),
         },
-        body: JSON.stringify(preparedStudent),
-      });
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan data siswa.',
+          });
+          return;
+        }
         setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyimpan data siswa.',
+          type: 'success',
+          text: `Data siswa ${editingStudent.name} berhasil disimpan dan disinkronkan ke seluruh modul${isFirebaseAdminReady() ? ' & Cloud Firestore' : ''}.`,
         });
-        return;
+      } else {
+        const localRes = applySaveStudentCloudLocal(payload, preparedStudent);
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(localRes.nextPayload, 'students');
+        }
+        setFeedbackBanner({
+          type: 'success',
+          text: `Data siswa ${editingStudent.name} berhasil disimpan & disinkronkan ke Cloud Firestore.`,
+        });
       }
-      setFeedbackBanner({
-        type: 'success',
-        text: `Data siswa ${editingStudent.name} berhasil disimpan dan disinkronkan ke seluruh modul${isFirebaseAdminReady() ? ' & Cloud Firestore' : ''}.`,
-      });
+
       setEditingStudent({
         nis: '',
         name: '',
@@ -1987,7 +2210,9 @@ export function AdminDashboard({
         nonAcademicActivity: 'OSIS Sekbid Olahraga',
         pin: '123456',
       });
-      await onRefresh('students');
+      if (apiRes.reachable) {
+        await onRefresh('students');
+      }
     } catch (err) {
       setFeedbackBanner({
         type: 'error',
@@ -2004,21 +2229,34 @@ export function AdminDashboard({
   async function handleDeleteStudent(stu: AdminStudentSummary) {
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry(
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
         `/api/admin/students/${encodeURIComponent(stu.id)}`,
         {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` },
-        }
+        },
+        isCloudAdminToken(token)
       );
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menghapus data siswa.',
-        });
-        return;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menghapus data siswa.',
+          });
+          return;
+        }
+      } else {
+        const localRes = applyDeleteStudentCloudLocal(payload, stu.id);
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(localRes.nextPayload, 'full');
+        }
       }
+
       if (editingStudent.id === stu.id) {
         setEditingStudent({
           nis: '',
@@ -2041,11 +2279,13 @@ export function AdminDashboard({
         type: 'success',
         text: `Siswa ${stu.name} (${stu.className}) dihapus. Daftar kelas disinkronkan otomatis.`,
       });
-      await onRefresh('students');
+      if (apiRes.reachable) {
+        await onRefresh('students');
+      }
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menghapus data siswa.',
+        text: 'Gagal menghapus data siswa.',
       });
     }
   }
@@ -2121,26 +2361,49 @@ export function AdminDashboard({
     setSavingMaterial(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/materials', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/materials',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            originalCode: editingMaterial.originalCode,
+            code: editingMaterial.code,
+            name: editingMaterial.name,
+          }),
         },
-        body: JSON.stringify({
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan materi inti PJOK.',
+          });
+          return;
+        }
+      } else {
+        const localRes = applySaveMaterialCloudLocal(payload, {
           originalCode: editingMaterial.originalCode,
           code: editingMaterial.code,
           name: editingMaterial.name,
-        }),
-      });
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyimpan materi inti PJOK.',
         });
-        return;
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(
+            localRes.nextPayload,
+            editingMaterial.originalCode ? 'full' : 'config'
+          );
+        }
       }
+
       const isEdit = Boolean(editingMaterial.originalCode);
       setFeedbackBanner({
         type: 'success',
@@ -2149,11 +2412,13 @@ export function AdminDashboard({
           : `Materi baru "${editingMaterial.name}" berhasil ditambahkan ke portal.`,
       });
       setEditingMaterial({ code: '', name: '', codeTouched: false });
-      await onRefresh();
+      if (apiRes.reachable) {
+        await onRefresh();
+      }
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menyimpan materi PJOK.',
+        text: 'Gagal menyimpan materi PJOK.',
       });
     } finally {
       setSavingMaterial(false);
@@ -2163,21 +2428,34 @@ export function AdminDashboard({
   async function handleDeleteMaterial(code: string, name: string) {
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry(
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
         `/api/admin/materials/${encodeURIComponent(code)}`,
         {
           method: 'DELETE',
           headers: { Authorization: `Bearer ${token}` },
-        }
+        },
+        isCloudAdminToken(token)
       );
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menghapus materi PJOK.',
-        });
-        return;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menghapus materi PJOK.',
+          });
+          return;
+        }
+      } else {
+        const localRes = applyDeleteMaterialCloudLocal(payload, code);
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(localRes.nextPayload, 'config');
+        }
       }
+
       if (editingMaterial.originalCode === code) {
         setEditingMaterial({ code: '', name: '', codeTouched: false });
       }
@@ -2185,11 +2463,13 @@ export function AdminDashboard({
         type: 'success',
         text: `Materi "${name}" (${code}) telah dihapus dari daftar materi aktif.`,
       });
-      await onRefresh();
+      if (apiRes.reachable) {
+        await onRefresh();
+      }
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menghapus materi PJOK.',
+        text: 'Gagal menghapus materi PJOK.',
       });
     }
   }
@@ -2203,27 +2483,51 @@ export function AdminDashboard({
       Math.min(100, Math.round(Number(editingSemester.kkm || 78)))
     );
     try {
-      const res = await apiFetchWithRetry('/api/admin/semesters', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/semesters',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            originalName: editingSemester.originalName,
+            name: editingSemester.name,
+            kkm: kkmVal,
+            setActive: editingSemester.setActive,
+          }),
         },
-        body: JSON.stringify({
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan periode / semester.',
+          });
+          return;
+        }
+      } else {
+        const localRes = applySaveSemesterCloudLocal(payload, {
           originalName: editingSemester.originalName,
           name: editingSemester.name,
           kkm: kkmVal,
           setActive: editingSemester.setActive,
-        }),
-      });
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyimpan periode / semester.',
         });
-        return;
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(
+            localRes.nextPayload,
+            editingSemester.originalName ? 'full' : 'config'
+          );
+        }
       }
+
       const isEdit = Boolean(editingSemester.originalName);
       if (isEdit && semesterFilter === editingSemester.originalName) {
         setSemesterFilter(editingSemester.name.trim());
@@ -2237,11 +2541,13 @@ export function AdminDashboard({
           : `Periode baru "${editingSemester.name}" (KKM ${kkmVal}) berhasil ditambahkan.`,
       });
       setEditingSemester({ name: '', kkm: '78', setActive: false });
-      await onRefresh();
+      if (apiRes.reachable) {
+        await onRefresh();
+      }
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menyimpan periode semester.',
+        text: 'Gagal menyimpan periode semester.',
       });
     } finally {
       setSavingSemester(false);
@@ -2264,31 +2570,43 @@ export function AdminDashboard({
       '9': parseKkm(draftClassKkm['9'], 75),
     };
     try {
-      const res = await apiFetchWithRetry('/api/admin/class-kkm', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/class-kkm',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ classKkm: nextMap }),
         },
-        body: JSON.stringify({ classKkm: nextMap }),
-      });
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyimpan KKM per tingkat kelas.',
-        });
-        return;
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan KKM per tingkat kelas.',
+          });
+          return;
+        }
+        await onRefresh('config');
+      } else {
+        const nextPayload = applySaveClassKkmCloudLocal(payload, nextMap);
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(nextPayload, 'config');
+        }
       }
+
       setFeedbackBanner({
         type: 'success',
         text: `KKM tingkat kelas diperbarui (Kelas 7: ${nextMap['7']}, Kelas 8: ${nextMap['8']}, Kelas 9: ${nextMap['9']}).`,
       });
-      await onRefresh('config');
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menyimpan KKM per tingkat kelas.',
+        text: 'Gagal menyimpan KKM per tingkat kelas.',
       });
     } finally {
       setSavingClassKkm(false);
@@ -2299,30 +2617,39 @@ export function AdminDashboard({
     setResettingDefaultCurriculum(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry(
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
         '/api/admin/reset-default-curriculum',
         {
           method: 'POST',
           headers: { Authorization: `Bearer ${token}` },
-        }
+        },
+        isCloudAdminToken(token)
       );
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menerapkan materi & KKM default.',
-        });
-        return;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menerapkan materi & KKM default.',
+          });
+          return;
+        }
+        await onRefresh();
+      } else {
+        const nextPayload = applyResetDefaultCurriculumCloudLocal(payload);
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(nextPayload, 'config');
+        }
       }
+
       setFeedbackBanner({
         type: 'success',
         text: '8 Materi Inti PJOK (termasuk Aktifitas Aquatik) & KKM Kelas 7 (78) berhasil diterapkan sebagai default dan disinkronkan.',
       });
-      await onRefresh();
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menerapkan data default.',
+        text: 'Gagal menerapkan data default.',
       });
     } finally {
       setResettingDefaultCurriculum(false);
@@ -2333,30 +2660,47 @@ export function AdminDashboard({
     setSavingDefaultSnapshot(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/default-snapshot', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         defaultSnapshotInfo?: DefaultSnapshotInfo;
         error?: string;
-      }>(res);
-      if (!res.ok) {
+      }>(
+        '/api/admin/default-snapshot',
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        },
+        isCloudAdminToken(token)
+      );
+
+      if (!apiRes.reachable) {
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(payload, 'full');
+        }
+        setFeedbackBanner({
+          type: 'success',
+          text: `Seluruh data nilai (${grades.length} entri) & siswa (${students.length} siswa) berhasil dicadangkan ke Cloud Firestore.`,
+        });
+        return;
+      }
+
+      if (!apiRes.ok) {
         setFeedbackBanner({
           type: 'error',
-          text: json.error || 'Gagal menyimpan kondisi data saat ini sebagai default.',
+          text:
+            apiRes.data.error ||
+            'Gagal menyimpan kondisi data saat ini sebagai default.',
         });
         return;
       }
       setFeedbackBanner({
         type: 'success',
-        text: `Data nilai (${json.defaultSnapshotInfo?.gradesCount ?? grades.length} entri) & siswa (${json.defaultSnapshotInfo?.studentsCount ?? students.length} siswa) saat ini berhasil disimpan sebagai Default Portal.`,
+        text: `Data nilai (${apiRes.data.defaultSnapshotInfo?.gradesCount ?? grades.length} entri) & siswa (${apiRes.data.defaultSnapshotInfo?.studentsCount ?? students.length} siswa) saat ini berhasil disimpan sebagai Default Portal.`,
       });
       await onRefresh('pull');
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menyimpan snapshot default.',
+        text: 'Gagal menyimpan snapshot default.',
       });
     } finally {
       setSavingDefaultSnapshot(false);
@@ -2367,39 +2711,52 @@ export function AdminDashboard({
     setResettingDefaultAll(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/reset-default-all', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ factoryReset }),
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         restoredFromCustomDefault?: boolean;
         studentsCount?: number;
         gradesCount?: number;
         error?: string;
-      }>(res);
-      if (!res.ok) {
+      }>(
+        '/api/admin/reset-default-all',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ factoryReset }),
+        },
+        isCloudAdminToken(token)
+      );
+
+      if (!apiRes.reachable) {
+        setConfirmResetAll(false);
         setFeedbackBanner({
           type: 'error',
-          text: json.error || 'Gagal mereset seluruh data ke default.',
+          text: 'Reset penuh ke setelan awal pabrik hanya tersedia saat terhubung ke server utama portal.',
+        });
+        return;
+      }
+
+      if (!apiRes.ok) {
+        setFeedbackBanner({
+          type: 'error',
+          text: apiRes.data.error || 'Gagal mereset seluruh data ke default.',
         });
         return;
       }
       setConfirmResetAll(false);
       setFeedbackBanner({
         type: 'success',
-        text: json.restoredFromCustomDefault
-          ? `Seluruh data berhasil dipulihkan ke Default Hasil Import (${json.studentsCount ?? students.length} siswa, ${json.gradesCount ?? 0} entri nilai) dan disinkronkan.`
+        text: apiRes.data.restoredFromCustomDefault
+          ? `Seluruh data berhasil dipulihkan ke Default Hasil Import (${apiRes.data.studentsCount ?? students.length} siswa, ${apiRes.data.gradesCount ?? 0} entri nilai) dan disinkronkan.`
           : 'Seluruh data portal (8 Materi Inti PJOK, KKM Kelas 7 = 78, 224 siswa dengan nilai awal 75) berhasil direset ke setelan awal pabrik.',
       });
       await onRefresh('full');
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat mereset seluruh data ke default.',
+        text: 'Gagal mereset seluruh data ke default.',
       });
     } finally {
       setResettingDefaultAll(false);
@@ -2409,32 +2766,51 @@ export function AdminDashboard({
   async function handleActivateSemester(name: string) {
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/semesters', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/semesters',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ name, setActive: true }),
         },
-        body: JSON.stringify({ name, setActive: true }),
-      });
-      const json = await safeParseJson<{ error?: string }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal mengaktifkan semester.',
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal mengaktifkan semester.',
+          });
+          return;
+        }
+        await onRefresh('config');
+      } else {
+        const localRes = applySaveSemesterCloudLocal(payload, {
+          name,
+          setActive: true,
         });
-        return;
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(localRes.nextPayload, 'config');
+        }
       }
+
       setSemesterFilter(name);
       setFeedbackBanner({
         type: 'success',
         text: `Periode "${name}" ditetapkan sebagai Semester Aktif portal.`,
       });
-      await onRefresh('config');
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat mengaktifkan semester.',
+        text: 'Gagal mengaktifkan semester.',
       });
     }
   }
@@ -2442,40 +2818,60 @@ export function AdminDashboard({
   async function handleDeleteSemester(name: string) {
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/semesters/delete', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ name }),
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         error?: string;
         activeSemester?: string;
-      }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menghapus semester.',
-        });
-        return;
+      }>(
+        '/api/admin/semesters/delete',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ name }),
+        },
+        isCloudAdminToken(token)
+      );
+
+      let nextActiveSemester: string | undefined;
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menghapus semester.',
+          });
+          return;
+        }
+        nextActiveSemester = apiRes.data.activeSemester;
+        await onRefresh();
+      } else {
+        const localRes = applyDeleteSemesterCloudLocal(payload, name);
+        if (!localRes.ok) {
+          setFeedbackBanner({ type: 'error', text: localRes.error });
+          return;
+        }
+        nextActiveSemester = localRes.activeSemester;
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(localRes.nextPayload, 'config');
+        }
       }
+
       if (editingSemester.originalName === name) {
         setEditingSemester({ name: '', kkm: '78', setActive: false });
       }
-      if (semesterFilter === name && json.activeSemester) {
-        setSemesterFilter(json.activeSemester);
+      if (semesterFilter === name && nextActiveSemester) {
+        setSemesterFilter(nextActiveSemester);
       }
       setFeedbackBanner({
         type: 'success',
         text: `Periode "${name}" dihapus dari daftar semester.`,
       });
-      await onRefresh();
     } catch {
       setFeedbackBanner({
         type: 'error',
-        text: 'Gagal terhubung ke server saat menghapus semester.',
+        text: 'Gagal menghapus semester.',
       });
     }
   }
@@ -2501,26 +2897,42 @@ export function AdminDashboard({
         };
       }
 
-      const res = await apiFetchWithRetry('/api/admin/settings', {
-        method: 'PUT',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
+      const apiRes = await tryJsonApiFetchWithRetry<{ error?: string }>(
+        '/api/admin/settings',
+        {
+          method: 'PUT',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify(preparedSettings),
         },
-        body: JSON.stringify(preparedSettings),
-      });
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: 'Gagal menyimpan pengaturan portal.',
-        });
-        return;
+        isCloudAdminToken(token)
+      );
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyimpan pengaturan portal.',
+          });
+          return;
+        }
+        await onRefresh('config');
+      } else {
+        const nextPayload = applySaveSettingsCloudLocal(
+          payload,
+          preparedSettings
+        );
+        if (onCommitCloudPayload) {
+          await onCommitCloudPayload(nextPayload, 'config');
+        }
       }
+
       setFeedbackBanner({
         type: 'success',
         text: `Pengaturan portal, logo sekolah, dan foto banner beranda berhasil diperbarui${isFirebaseAdminReady() ? ' dan disinkronkan ke Cloud Firestore' : ''}.`,
       });
-      await onRefresh('config');
     } catch (err) {
       setFeedbackBanner({
         type: 'error',
@@ -2538,28 +2950,50 @@ export function AdminDashboard({
     setSyncingAllGrades(true);
     setFeedbackBanner(null);
     try {
-      const res = await apiFetchWithRetry('/api/admin/grades/sync-all', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const json = await safeParseJson<{
+      const apiRes = await tryJsonApiFetchWithRetry<{
         error?: string;
         removedCount?: number;
         updatedCount?: number;
         totalGrades?: number;
         grades?: GradeRecord[];
-      }>(res);
-      if (!res.ok) {
-        setFeedbackBanner({
-          type: 'error',
-          text: json.error || 'Gagal menyinkronkan data nilai.',
-        });
-        return;
+      }>(
+        '/api/admin/grades/sync-all',
+        {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${token}` },
+        },
+        isCloudAdminToken(token)
+      );
+
+      let syncResPayload: {
+        removedCount: number;
+        updatedCount: number;
+        totalGrades: number;
+        grades: GradeRecord[];
+      };
+
+      if (apiRes.reachable) {
+        if (!apiRes.ok) {
+          setFeedbackBanner({
+            type: 'error',
+            text: apiRes.data.error || 'Gagal menyinkronkan data nilai.',
+          });
+          return;
+        }
+        syncResPayload = {
+          removedCount: apiRes.data.removedCount ?? 0,
+          updatedCount: apiRes.data.updatedCount ?? 0,
+          totalGrades: apiRes.data.totalGrades ?? apiRes.data.grades?.length ?? 0,
+          grades: apiRes.data.grades ?? [],
+        };
+      } else {
+        syncResPayload = applySyncAllGradesCloudLocal(payload);
       }
+
       let cloudSynced = false;
-      if (json.grades && onApplyGradeMutations) {
+      if (onApplyGradeMutations) {
         const syncRes = await onApplyGradeMutations({
-          savedGrades: json.grades,
+          savedGrades: syncResPayload.grades,
           replaceAllGrades: true,
         });
         cloudSynced = syncRes.cloudSynced;
@@ -2569,7 +3003,7 @@ export function AdminDashboard({
       }
       setFeedbackBanner({
         type: 'success',
-        text: `Sinkronisasi penuh berhasil: ${json.totalGrades ?? json.grades?.length ?? 0} data nilai terverifikasi sama persis dengan nilai yang diinput (${json.removedCount ?? 0} entri lama dibersihkan, ${json.updatedCount ?? 0} entri diselaraskan${cloudSynced ? ' & disinkronkan ke Cloud Firestore' : ' di server lokal — hubungkan Google Cloud untuk semua perangkat'}).`,
+        text: `Sinkronisasi penuh berhasil: ${syncResPayload.totalGrades} data nilai terverifikasi sama persis dengan nilai yang diinput (${syncResPayload.removedCount} entri lama dibersihkan, ${syncResPayload.updatedCount} entri diselaraskan${cloudSynced ? ' & disinkronkan ke Cloud Firestore' : ' — hubungkan Google Cloud untuk semua perangkat'}).`,
       });
     } catch (err) {
       setFeedbackBanner({
@@ -2577,7 +3011,7 @@ export function AdminDashboard({
         text:
           err instanceof Error
             ? err.message
-            : 'Gagal terhubung ke server saat menyinkronkan seluruh nilai.',
+            : 'Gagal menyinkronkan seluruh nilai.',
       });
     } finally {
       setSyncingAllGrades(false);
@@ -2597,10 +3031,15 @@ export function AdminDashboard({
           });
         }
       } else {
-        await apiFetchWithRetry('/api/admin/grades/sync-all', {
-          method: 'POST',
-          headers: { Authorization: `Bearer ${token}` },
-        }).catch(() => {});
+        await tryJsonApiFetchWithRetry(
+          '/api/admin/grades/sync-all',
+          {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${token}` },
+          },
+          isCloudAdminToken(token),
+          0
+        );
         await onRefresh('sync');
         setFeedbackBanner({
           type: 'success',
