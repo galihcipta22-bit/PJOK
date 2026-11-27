@@ -364,7 +364,7 @@ export async function signInAdminWithGoogle(
           : '';
       if (code === 'auth/popup-blocked') {
         throw new Error(
-          'Jendela login Google diblokir oleh browser. Izinkan pop-up untuk situs ini atau klik langsung tombol "Masuk via Google Admin".'
+          'Jendela login Google diblokir oleh browser. Izinkan pop-up untuk situs ini lalu coba masuk kembali.'
         );
       }
       if (

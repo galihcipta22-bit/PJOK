@@ -2,7 +2,6 @@ import { KeyRound, ShieldCheck, UserCheck, X } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
 import { tryJsonApiFetch } from '../lib/cloudAdminOperations.ts';
 import {
-  AUTHORIZED_ADMIN_EMAIL,
   CLOUD_ADMIN_TOKEN,
   getStudentReportFromCloudByNis,
   isFirebaseAdminReady,
@@ -28,7 +27,6 @@ export function LoginModal({
   const [nis, setNis] = useState('');
   const [adminId, setAdminId] = useState('');
   const [loading, setLoading] = useState(false);
-  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState('');
 
   if (!open) return null;
@@ -139,13 +137,7 @@ export function LoginModal({
             cloudErr instanceof Error
               ? cloudErr.message
               : 'Verifikasi akun Google Admin gagal.';
-          if (/popup|jendela/i.test(msg)) {
-            setError(
-              `${msg} Gunakan tombol "Masuk via Google Admin" di bawah agar popup langsung diizinkan oleh browser perangkat ini.`
-            );
-          } else {
-            setError(msg);
-          }
+          setError(msg);
           return;
         }
       }
@@ -160,50 +152,6 @@ export function LoginModal({
       );
     } finally {
       setLoading(false);
-    }
-  }
-
-  async function handleGoogleAdminLogin() {
-    setError('');
-    setGoogleLoading(true);
-    try {
-      // Trigger Google sign-in synchronously from user click so mobile/strict browsers allow popup
-      if (!isFirebaseAdminReady()) {
-        await signInAdminWithGoogle('Galih Cipta Setia, S.Pd.');
-      }
-
-      // Check if local backend is also reachable so hybrid sync can run if available
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), 2500);
-      try {
-        const apiRes = await tryJsonApiFetch<{ token?: string }>(
-          '/api/auth/admin',
-          {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ adminId: 'galihpjok26' }),
-            signal: controller.signal,
-          }
-        );
-        if (apiRes.reachable && apiRes.ok && apiRes.data.token) {
-          onAdminSuccess(apiRes.data.token);
-          onClose();
-          return;
-        }
-      } finally {
-        window.clearTimeout(timeoutId);
-      }
-
-      onAdminSuccess(CLOUD_ADMIN_TOKEN);
-      onClose();
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : `Gagal masuk dengan akun Google Admin (${AUTHORIZED_ADMIN_EMAIL}).`
-      );
-    } finally {
-      setGoogleLoading(false);
     }
   }
 
@@ -310,64 +258,37 @@ export function LoginModal({
               </button>
             </form>
           ) : (
-            <div className="space-y-4">
-              <form onSubmit={handleAdminSubmit} className="space-y-4">
-                <div>
-                  <label
-                    htmlFor="admin-id"
-                    className="block text-xs font-semibold text-slate-700"
-                  >
-                    ID Admin Guru PJOK
-                  </label>
-                  <input
-                    id="admin-id"
-                    type="text"
-                    required
-                    autoFocus
-                    value={adminId}
-                    onChange={(e) => setAdminId(e.target.value)}
-                    placeholder="Masukkan ID Admin Guru PJOK"
-                    className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm text-slate-900 focus:border-emerald-600 focus:outline-none"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={loading || googleLoading}
-                  className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-60"
+            <form onSubmit={handleAdminSubmit} className="space-y-4">
+              <div>
+                <label
+                  htmlFor="admin-id"
+                  className="block text-xs font-semibold text-slate-700"
                 >
-                  <KeyRound className="h-4 w-4" />
-                  <span>
-                    {loading ? 'Memverifikasi ID...' : 'Masuk Dashboard Guru PJOK'}
-                  </span>
-                </button>
-              </form>
-
-              <div className="relative py-1">
-                <div className="absolute inset-0 flex items-center">
-                  <span className="w-full border-t border-slate-200" />
-                </div>
-                <div className="relative flex justify-center text-[11px] uppercase">
-                  <span className="bg-white px-2 text-slate-400">
-                    atau login lintas perangkat
-                  </span>
-                </div>
+                  ID Admin Guru PJOK
+                </label>
+                <input
+                  id="admin-id"
+                  type="text"
+                  required
+                  autoFocus
+                  value={adminId}
+                  onChange={(e) => setAdminId(e.target.value)}
+                  placeholder="Masukkan ID Admin Guru PJOK"
+                  className="mt-1.5 w-full rounded-lg border border-slate-300 px-3.5 py-2.5 font-mono text-sm text-slate-900 focus:border-emerald-600 focus:outline-none"
+                />
               </div>
 
               <button
-                type="button"
-                onClick={() => void handleGoogleAdminLogin()}
-                disabled={loading || googleLoading}
-                className="flex w-full items-center justify-center gap-2 rounded-lg border border-emerald-600 bg-emerald-50 px-4 py-2.5 text-xs font-semibold text-emerald-800 transition-colors hover:bg-emerald-100 disabled:opacity-60"
+                type="submit"
+                disabled={loading}
+                className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:opacity-60"
               >
-                <ShieldCheck className="h-4 w-4 text-emerald-700" />
+                <KeyRound className="h-4 w-4" />
                 <span>
-                  {googleLoading
-                    ? 'Membuka Login Google Admin...'
-                    : `Masuk via Google Admin (${AUTHORIZED_ADMIN_EMAIL})`}
+                  {loading ? 'Memverifikasi ID...' : 'Masuk Dashboard Guru PJOK'}
                 </span>
               </button>
-            </div>
+            </form>
           )}
         </div>
       </div>
